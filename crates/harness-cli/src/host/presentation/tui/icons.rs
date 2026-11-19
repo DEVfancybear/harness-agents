@@ -60,7 +60,7 @@ impl ToolKind {
             "bash" | "run_shell" | "run_process" | "read_process_output" | "stop_process" => {
                 Self::Shell
             }
-            "git_status" | "git_diff" | "git_log" => Self::Git,
+            "git_status" | "git_diff" | "git_log" | "git_search" | "git_show" => Self::Git,
             "web_search" | "web_fetch" => Self::Web,
             "delegate" | "list_subagents" | "agent_message" | "stop_subagent"
             | "integrate_children" => Self::Agent,

@@ -489,6 +489,47 @@ Kết quả ghi rõ việc này.
 - **`history_read`** trả thêm `previous_source_id` và `next_source_id` trong cùng
   phiên, theo `sequence`, để đọc nối tiếp mà không phải tìm lại.
 
+### Lịch sử của chính repository: `git_search` và `git_show`
+
+Memory và journal giữ những gì các hội thoại đã nói. Còn những gì chính repository
+ghi lại về quá khứ của nó, tức các commit, trước đây chỉ liệt kê được (`git_log`,
+các commit mới nhất) chứ không tìm được, và không đọc được một commit đã đổi gì.
+Hai tool chỉ đọc giải quyết việc đó, theo RepoMem (arXiv 2510.01003, "Improving
+Code Localization with Repository Memory"), nơi cho agent tìm trong message của
+các commit cũ và đọc diff của commit tìm được đã cải thiện việc định vị file
+(SWE-bench Verified Acc@5 từ 71,6 lên 74,3 chỉ nhờ phần này):
+
+- **`git_search`** đọc message của 5000 commit mới nhất (một lần `git log` với danh
+  sách tham số, không bao giờ là một chuỗi lệnh) và xếp hạng chúng theo truy vấn
+  bằng BM25 trên các từ mà `harness_types::readout::words` đọc (phần còn lại của
+  ha cũng đọc chúng), cộng thêm các mảnh của một từ viết có chỗ nối: `words` hạ
+  chữ thường trước khi tách, nên `parseHeader` trước đây chỉ là `parseheader` và
+  không tìm ra `parse_header`; nay các term còn được cắt từ chữ gốc ở chỗ chuyển từ
+  thường sang hoa (`HTTPServer` là `http` và `server`) và giữa chữ với số, cho cả
+  truy vấn lẫn mọi commit. Đường dẫn file đều thành các term. Từ trong subject tính gấp ba từ trong body; tên các file đã đổi cũng tính là từ, nên
+  lịch sử của một file tìm được bằng chính tên nó. Nó dùng `bm25_idf` và `bm25_term`
+  của `harness_types::search`, bản BM25 duy nhất cho các crate không thấy được chỉ
+  mục memory. Một kết quả hiện hash ngắn, ngày, tác giả, subject, đầu phần body và
+  tám file đã đổi đầu tiên; lịch sử dài hơn 5000 commit, hay một log quá lớn để giữ
+  (8 MiB), đều được nói rõ trong câu trả lời. `path` chỉ giữ các commit đã chạm vào
+  nó. Tên file là tên theo workspace: khi workspace là một thư mục con của
+  repository (vị trí đọc bằng `git rev-parse --show-prefix`), `app/src/a.rs` hiện
+  là `src/a.rs`, và file nằm ngoài là `(outside the workspace) ../other.txt` chứ
+  không bị bỏ. (Trước đây chúng in từ gốc repository.)
+- **`git_show`** trước hết phân giải `commit` bằng `git rev-parse --verify
+  <rev>^{commit}`, sau khi từ chối mọi thứ không phải một revision (một option, một
+  khoảng trắng, một khoảng commit), và từ đó dùng hash đầy đủ. Nó in hash, tác giả,
+  ngày, toàn bộ message, các file đã đổi cùng số dòng thêm và xoá (`--numstat`) và
+  diff, phân trang bằng `offset` và `length` như `history_read`: câu trả lời nêu
+  `offset` để đọc tiếp. Trong workspace nằm dưới gốc repository, diff được đọc với
+  `--relative`, nên nêu cùng các đường dẫn với danh sách file, và nói rằng các file
+  đánh dấu "outside" không có trong đó.
+
+Nửa còn lại của RepoMem, "semantic memory" (một bản tóm tắt bằng LLM cho mỗi file
+trong 200 file được sửa nhiều nhất), không được lấy: nó tốn một lần gọi model cho
+mỗi file, chỉ đáng khoảng 2 điểm trong bài báo, và làm hại các repository có ít lịch
+sử. Phần tìm commit là nửa "episodic", và nó không cần lần gọi model nào.
+
 ## 8. Lệnh `ha memory`
 
 `ha memory` làm việc trên các kho memory và trên kho memory markdown của một

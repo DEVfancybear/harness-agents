@@ -1,6 +1,6 @@
 # Strategy revision and the runtime harness
 
-What ha took from two papers, how it works, and what is not taken.
+What ha took from these papers, how it works, and what is not taken.
 
 - **[A] arXiv 2608.19072**, *What Is Missing from AI Post-Training AI*: agents
   execute well and lock into the strategy they start with. Only 2.1% of
@@ -101,6 +101,38 @@ is evaluated).
   Nothing asks the user to choose.
 - **The review reads the task's strategy record** with the conversation, so a
   strategy that stalled can become a lesson for the next task.
+
+## Recovery from an empty step ([C])
+
+- **[C] arXiv 2611.22299**, *Harnesses That Improve Themselves*, lists the runtime
+  mechanisms that self-evolving harnesses keep inventing. Two were missing:
+  recovery from an empty turn (this section) and a shell that keeps where the
+  last call left off ([guards](GUARDS.en.md), "Where a command runs").
+
+A step whose reply has no text and no tool call used to be taken as the turn's
+final answer: the user got an empty answer and the turn ended, even when the model
+had only stalled (its reasoning could be long). Now, in the chain that runs when a
+step calls no tool (`crates/harness-tools/src/runtime/turn_driver.rs`), after a
+steering message the user sent and before the stop hook, the verify reminder and the
+self-evaluation, an empty step is continued, **once per turn**:
+
+- It needs: no text in the reply, no tool call, a step left (`HA_TURN_MAX_STEPS`),
+  and no cancellation. With a goal, an empty reply is not accepted as the answer
+  already (the evaluator calls it unverified), so nothing changes there.
+- The model is sent a host message in the user role (kept with `record_host_message`,
+  as the verify reminder is): *Your last reply had no text and called no tool.
+  Continue the task from where it stands: call the tool needed next, or give the
+  answer.* When the reasoning of that step is not empty, its last 600 characters
+  (cut at a character boundary) follow, so the model sees where it stopped.
+- The user sees one notice (`the last reply had no text and no tool call; asking the
+  model to continue`), and diagnostics get a `turn` / `empty_step_continued` record
+  with `step` and `had_reasoning`.
+- A second empty step in the same turn ends it as before.
+
+An empty step cannot be forced on a real model, so the live suite
+(`scripts/testing/live-tests/runtime-gaps.sh`) only reports how many of these
+records its own runs produced. The unit tests drive the real turn loop with a
+scripted model.
 
 ## Off
 

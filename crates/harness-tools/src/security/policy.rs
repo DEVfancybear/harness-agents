@@ -531,6 +531,8 @@ impl ToolPolicy {
                 | CodingToolAction::FindFiles { .. }
                 | CodingToolAction::GitDiff { .. }
                 | CodingToolAction::GitLog { .. }
+                | CodingToolAction::GitSearch { .. }
+                | CodingToolAction::GitShow { .. }
                 | CodingToolAction::GitStatus
         );
         let path = action
@@ -677,6 +679,8 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
         | CodingToolAction::FindFiles { path, .. }
         | CodingToolAction::GitDiff { path }
         | CodingToolAction::GitLog { path, .. }
+        | CodingToolAction::GitSearch { path, .. }
+        | CodingToolAction::GitShow { path, .. }
             if path.as_deref().is_some_and(|value| value.trim().is_empty()) =>
         {
             Err(HarnessError::new(
@@ -684,9 +688,15 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
                 "optional tool path must not be blank",
             ))
         }
-        CodingToolAction::SearchText { query, .. } if query.trim().is_empty() => Err(
-            HarnessError::new(ErrorCode::InvalidPayload, "search query must not be empty"),
-        ),
+        CodingToolAction::SearchText { query, .. } | CodingToolAction::GitSearch { query, .. }
+            if query.trim().is_empty() =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "search query must not be empty",
+            ))
+        }
+        CodingToolAction::GitShow { commit, .. } => crate::git_history::check_revision(commit),
         CodingToolAction::Glob { pattern, .. } if pattern.trim().is_empty() => Err(
             HarnessError::new(ErrorCode::InvalidPayload, "glob pattern must not be empty"),
         ),

@@ -107,6 +107,71 @@ lượt chat và bởi `ha exec`, nên tool của child cũng được bảo v�
 coder nằm trong thư mục state của ha. Bên trong workspace thì chỉ `.harness` bị
 tính, nên child tự do sửa worktree của chính nó.
 
+**Lệnh chạy ở đâu.** Mỗi lần gọi `run_shell` và `run_process` trước đây đều bắt
+đầu ở gốc workspace với `PATH` của host, nên `cd sub` (hoặc `Set-Location sub`)
+ở lần gọi này mất ở lần gọi sau, và model chạy lệnh tiếp theo sai chỗ. Python REPL
+giữ được `os.chdir`, còn shell thì không. arXiv 2611.22299, *Harnesses That
+Improve Themselves*, kể vị trí shell được giữ lại trong các cơ chế runtime mà
+những harness tự tiến hoá cứ phải tự nghĩ ra. Nay (`processes/location.rs`):
+
+- Host đặt một đoạn ghi nhận phía trước mỗi lệnh `run_shell`, không bao giờ nối
+  sau nó (chữ nối thêm sau lệnh bị đọc như một phần của lệnh: heredoc không có
+  điểm kết hay dấu gạch chéo ngược ở cuối nuốt mất nó, và lệnh tự thoát thì không
+  bao giờ chạy tới). Khi shell thoát, bằng cách nào cũng vậy, nó ghi thư mục cuối
+  và `PATH` vào một file phụ do host chọn trong spool của process (không bao giờ
+  ghi ra stdout), và giữ nguyên trạng thái như lệnh đã tạo ra:
+  - `sh`: một bẫy `EXIT` lưu `$?`, ghi `pwd` và `$PATH`, rồi thoát với trạng thái
+    đã lưu. Lệnh tự đặt bẫy `EXIT` thì thay bẫy của ta: không giữ vị trí nào cho
+    nó (hành vi cũ). Lỗi cú pháp để vị trí ở chỗ lần gọi bắt đầu.
+  - `pwsh` và `powershell.exe`: một sự kiện engine `PowerShell.Exiting` đăng ký
+    đầu tiên (nó cũng chạy khi `exit N`, trên PowerShell 7 và 5.1), và một dòng
+    trạng thái sau lệnh và một dòng trống. Đã đo trên cả hai: `-Command` thoát 0
+    khi câu lệnh cuối thành công, 1 khi nó hỏng (mã riêng của chương trình native
+    bị mất) và N với `exit N`. Dòng trạng thái thoát 0 khi thành công,
+    `$LASTEXITCODE` của chương trình native khi lệnh hỏng và nó là số nguyên khác
+    0, còn lại là 1; nên `exit 5` của một chương trình native nay cho 5 (trước là
+    1), thành công vẫn là 0, và `exit N` vẫn là N. Lệnh không parse được thì
+    không chạy gì, nên vị trí giữ nguyên.
+  - Lệnh bị kill, hết giờ hoặc bị huỷ thì không ghi file, nên vị trí giữ nguyên.
+- Host giữ, theo từng cuộc trò chuyện (task), thư mục và `PATH` cuối cùng; lần
+  `run_shell` và `run_process` tiếp theo của cuộc trò chuyện đó bắt đầu từ đó.
+- Các lần gọi của một cuộc trò chuyện lần lượt chờ nhau: một lần gọi đọc vị trí
+  bắt đầu và lưu vị trí kết thúc khi đang giữ khoá của cuộc trò chuyện, sau khi
+  mọi lần gọi trước nó đã lưu xong. Trước đây nó đọc vị trí trước khi giữ permit
+  của process, nên hai lần gọi chạy cùng lúc có thể lưu vị trí cũ đè lên vị trí
+  mới. (Một batch của turn vốn đã chạy `run_shell` và `run_process` từng cái một;
+  điều này đúng cả khi chúng không như vậy, và `bash()` của Python REPL không đọc
+  hay đổi vị trí.)
+- Thư mục chỉ được giữ khi nó nằm trong gốc workspace sau khi đã resolve (link
+  trỏ ra ngoài không tính). Ngoài workspace thì lần gọi sau bắt đầu ở gốc, và
+  kết quả nói điều đó trong một dòng. `PATH` chỉ được giữ khi khác `PATH` của
+  host. Không biến nào khác được giữ: môi trường chứa bí mật.
+- `PATH` được giữ chỉ là cái lệnh chạy với nó. Shell được tìm trong `PATH` của
+  chính host và khởi chạy bằng đường dẫn đầy đủ, nên một lần gọi làm rỗng `PATH`
+  không để lần sau không còn shell để chạy. `run_process` một chương trình gọi
+  bằng tên trần thì được tìm trong `PATH` đã giữ và, nếu không có ở đó, không
+  khởi chạy (`the program did not start ... it is not on the PATH an earlier
+  shell call set; nothing ran`), như một shell với `PATH` đó sẽ nói. Nếu không,
+  Windows vẫn tìm thấy nó trong `PATH` của host.
+- Guard lệnh của Jev xét một lần gọi ở cổng, trước khi duyệt, từ chỗ shell đang
+  đứng lúc đó. Không thể giữ khoá của cuộc trò chuyện từ đó tới lúc dispatch
+  (guard là một lần gọi model, và bước duyệt chờ một người), nên dispatch, khi đang
+  giữ khoá, so thư mục nó bắt đầu với thư mục guard đã xét và, khi khác nhau (một
+  lần gọi của cuộc trò chuyện đã chạy xen giữa), hỏi guard lại từ thư mục đúng.
+  Nếu bị từ chối thì đó là kết quả của lần gọi; lệnh không bao giờ chạy dựa trên
+  một phán quyết cho thư mục khác.
+- Các guard ở trên đọc đường dẫn tương đối từ thư mục lệnh chạy, không phải từ
+  gốc: `recursive-delete` (xoá việc chưa commit, gọi tên từ thư mục đã giữ, bị từ
+  chối; đọc từ gốc thì nó không chỉ vào gì và được qua), `harness-integrity`,
+  guard git phá huỷ (`git status` của nó chạy ở đó) và guard lệnh của Jev
+  (`working_dir`, và các script nó đọc). Một `cd` trong cùng lệnh vẫn để các đích
+  sau nó không kiểm được, như trước. Danh sách file trong bản tóm tắt khi nén đọc
+  từ thư mục mà kết quả của lệnh nêu tên.
+- Kết quả cho biết lệnh chạy ở đâu khi đó không phải gốc (`ran in sub`) và, khi
+  lệnh đã chuyển chỗ, lệnh tiếp theo sẽ bắt đầu ở đâu.
+- `HA_SHELL_KEEP_LOCATION=off` trả lại hành vi cũ: mọi lần gọi bắt đầu ở gốc với
+  `PATH` của host.
+
 ## 4. Giá trị trông như key
 
 `secret_values` nhận ra:

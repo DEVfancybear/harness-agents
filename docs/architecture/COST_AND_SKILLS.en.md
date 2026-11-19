@@ -185,12 +185,17 @@ buffer, `revision_stats`) and `crates/harness-cli/src/host/memory/refine.rs`
   trial, the use counts for or against that revision (and a revision that
   then replaces a failing one keeps the sound incumbent, the failing one kept
   as `superseded`); with none, it counts for the incumbent.
-- **Rejected revisions are kept and shown.** Each skill keeps its last five
-  refused (the promoter refused it even after the repair pass), rolled-back,
-  or superseded (replaced while judged worse) revisions, with the reason and a short summary of the edits. The refiner's
-  and the curator's view of the library shows up to three under the skill
-  (`rejected before: rolled_back 2026-11-18: ...; tried: ...`), and the
-  history names the reason a skill edit failed.
+- **Revisions are kept and shown as one history.** Each skill keeps its last
+  five refused (the promoter refused it even after the repair pass),
+  rolled-back, or superseded (replaced while judged worse) revisions and its
+  last five accepted ones, each with the cause it addressed, what it expected
+  and the judged uses it got (`cause` and `expect` are asked of the planner;
+  see [the self-improvement gate](SELF_IMPROVEMENT_GATE.en.md)). The refiner's
+  and the curator's view of the library shows the last three, oldest first,
+  under the skill (`revised 2026-11-18 (rolled_back): cause: ...; expected:
+  ...; observed: 0 good, 2 bad; why not kept: ...; tried: ...`), with the
+  skill's standing (`regressed`, `unsolved`, `mastered`), and the history names
+  the reason a skill edit failed.
 - **`ha learning report`** counts, over 30 days, revisions, those on trial
   now, accepted, rolled back and refused (from
   `<data>/skill-usage/revisions.jsonl`).
@@ -322,6 +327,7 @@ calls, arguments and results from the journal), wired in
   the revised skill stand in for it, and replace "strictly better on the
   split" with "two judged uses better than worse".
 - **P4's Teacher**: ha trains no model.
+- **GUARD's check of a revision against what worked before it lands**: the maintainer chose not to take it; the trial with rollback stands for it ([the self-improvement gate](SELF_IMPROVEMENT_GATE.en.md), section 5).
 
 ## 9. Tests
 

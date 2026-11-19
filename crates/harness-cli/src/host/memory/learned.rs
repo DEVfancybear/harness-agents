@@ -57,7 +57,10 @@ pub const BODY_MAX_LINES: usize = 30;
 pub const SKILL_EDIT_BUDGET: usize = 4;
 /// The rejected revisions a skill keeps, and how many the refiner is shown.
 const REJECTED_KEPT: usize = 5;
-const REJECTED_SHOWN: usize = 3;
+/// The accepted revisions a skill keeps: its history of what stood.
+const REVISIONS_KEPT: usize = 5;
+/// The lines of a skill's revision history the refiner is shown.
+const REVISIONS_SHOWN: usize = 3;
 /// What each part of a rejected revision's summary is clipped to.
 const SUMMARY_PART_CHARS: usize = 120;
 /// Revision events, one JSON line each, for `ha learning report`.
@@ -1143,7 +1146,7 @@ fn incumbent_sound(incumbent: &Value) -> bool {
 }
 
 /// One line of `text`: whitespace folded, redacted, clipped to `limit`.
-fn one_line(text: &str, limit: usize) -> String {
+pub(super) fn one_line(text: &str, limit: usize) -> String {
     let flat = redact(text.trim())
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1206,20 +1209,69 @@ fn rejected_record(
     })
 }
 
-/// Keep `record` among the skill's last [`REJECTED_KEPT`] rejected revisions.
-fn push_rejected(usage: &mut Value, name: &str, record: Value) {
+/// What a revision was for and how it went, added to its record (SIM,
+/// arXiv 2611.18856): the root cause it addressed, what it expected, and the
+/// judged uses it got. A record from before the cause was asked for has none,
+/// and reads as it did.
+fn with_hypothesis(
+    mut record: Value,
+    cause: &str,
+    expect: &str,
+    observed: Option<(u64, u64)>,
+) -> Value {
+    if !cause.trim().is_empty() {
+        record["cause"] = json!(one_line(cause, HYPOTHESIS_CHARS));
+    }
+    if !expect.trim().is_empty() {
+        record["expect"] = json!(one_line(expect, HYPOTHESIS_CHARS));
+    }
+    if let Some((good, bad)) = observed {
+        record["good"] = json!(good);
+        record["bad"] = json!(bad);
+    }
+    record
+}
+
+/// The longest a revision's cause or expectation is kept.
+const HYPOTHESIS_CHARS: usize = 300;
+
+/// Keep `record` at the end of the skill's list `field`, the last `kept`.
+fn push_bounded(usage: &mut Value, name: &str, field: &str, record: Value, kept: usize) {
     if !usage["skills"][name].is_object() {
         usage["skills"][name] = json!({});
     }
-    let rejected = &mut usage["skills"][name]["rejected"];
-    if !rejected.is_array() {
-        *rejected = json!([]);
+    let list = &mut usage["skills"][name][field];
+    if !list.is_array() {
+        *list = json!([]);
     }
-    if let Some(rejected) = rejected.as_array_mut() {
-        rejected.push(record);
-        let excess = rejected.len().saturating_sub(REJECTED_KEPT);
-        rejected.drain(..excess);
+    if let Some(list) = list.as_array_mut() {
+        list.push(record);
+        let excess = list.len().saturating_sub(kept);
+        list.drain(..excess);
     }
+}
+
+/// Keep `record` among the skill's last [`REJECTED_KEPT`] rejected revisions.
+fn push_rejected(usage: &mut Value, name: &str, record: Value) {
+    push_bounded(usage, name, "rejected", record, REJECTED_KEPT);
+}
+
+/// Keep the revision the trial `trial` judged, with its `(good, bad)` judged
+/// uses, among the skill's last [`REVISIONS_KEPT`] accepted ones. Before, only
+/// the rejected revisions were kept, so the refiner never saw what had stood.
+fn push_accepted(usage: &mut Value, name: &str, trial: &Value, observed: (u64, u64)) {
+    let record = with_hypothesis(
+        json!({
+            "at": now(),
+            "kind": "accepted",
+            "ledger_id": trial["ledger_id"],
+            "edits_summary": trial["edits_summary"],
+        }),
+        trial["cause"].as_str().unwrap_or_default(),
+        trial["expect"].as_str().unwrap_or_default(),
+        Some(observed),
+    );
+    push_bounded(usage, name, "revisions", record, REVISIONS_KEPT);
 }
 
 /// Keep that the promoter refused `intent` for the learned skill it names, even
@@ -1234,12 +1286,17 @@ pub fn record_refused(layers: &Layers, intent: &Intent, findings: &str) -> bool 
         push_rejected(
             usage,
             &intent.name,
-            rejected_record(
-                "refused",
+            with_hypothesis(
+                rejected_record(
+                    "refused",
+                    None,
+                    findings,
+                    &edits_summary(intent),
+                    &intent.evidence,
+                ),
+                &intent.cause,
+                &intent.expect,
                 None,
-                findings,
-                &edits_summary(intent),
-                &intent.evidence,
             ),
         );
     });
@@ -1279,18 +1336,41 @@ fn begin_trial(usage: &mut Value, name: &str, ledger_id: &str, intent: &Intent, 
     if counters["trial"].is_object() && (good + bad == 0 || failing) {
         if failing {
             let old = &counters["trial"];
-            let record = rejected_record(
-                "superseded",
-                old["ledger_id"].as_str(),
-                &format!(
-                    "replaced by a later revision while judged worse: {bad} bad, {good} good uses"
+            let record = with_hypothesis(
+                rejected_record(
+                    "superseded",
+                    old["ledger_id"].as_str(),
+                    &format!(
+                        "replaced by a later revision while judged worse: {bad} bad, {good} good uses"
+                    ),
+                    old["edits_summary"].as_str().unwrap_or_default(),
+                    "",
                 ),
-                old["edits_summary"].as_str().unwrap_or_default(),
-                "",
+                old["cause"].as_str().unwrap_or_default(),
+                old["expect"].as_str().unwrap_or_default(),
+                Some((good, bad)),
             );
             push_rejected(usage, name, record);
         }
         let trial = &mut usage["skills"][name]["trial"];
+        // A fix of a failing revision has a cause of its own; changes that
+        // join one revision are one hypothesis, each cause told once.
+        if failing && let Some(trial) = trial.as_object_mut() {
+            trial.remove("cause");
+            trial.remove("expect");
+        }
+        for (field, text) in [("cause", &intent.cause), ("expect", &intent.expect)] {
+            let text = one_line(text, HYPOTHESIS_CHARS);
+            let kept = trial[field].as_str().unwrap_or_default().to_owned();
+            if text.is_empty() || kept.contains(&text) {
+                continue;
+            }
+            trial[field] = json!(if kept.is_empty() {
+                text
+            } else {
+                one_line(&format!("{kept}; {text}"), HYPOTHESIS_CHARS)
+            });
+        }
         trial["ledger_id"] = json!(ledger_id);
         if let Some(ids) = trial["ledger_ids"].as_array_mut() {
             ids.push(json!(ledger_id));
@@ -1324,22 +1404,32 @@ fn begin_trial(usage: &mut Value, name: &str, ledger_id: &str, intent: &Intent, 
     // What the version being replaced cost per turn: the sums it had when the
     // revision landed, from which the revision's own are the difference.
     let incumbent_cost = Cost::from_value(&usage["skills"][name]["cost"]);
-    usage["skills"][name]["trial"] = json!({
-        "action": intent.action,
-        "objective": if intent.prune { OBJECTIVE_PRUNE } else { OBJECTIVE_REPAIR },
-        "ledger_id": ledger_id,
-        "ledger_ids": [ledger_id],
-        "began": now(),
-        "incumbent": incumbent_of(&usage["skills"][name]),
-        "incumbent_cost": incumbent_cost.to_value(),
-        "incumbent_mean": {
-            "steps": incumbent_cost.mean_steps(),
-            "tool_calls": incumbent_cost.mean_tool_calls(),
-            "output_tokens": incumbent_cost.mean_output_tokens(),
-        },
-        "edits_summary": summary,
-        "undo": undo,
-    });
+    // An older trial judged no worse stood: it is kept in the history.
+    let older = usage["skills"][name]["trial"].clone();
+    if older.is_object() {
+        push_accepted(usage, name, &older, (good, bad));
+    }
+    usage["skills"][name]["trial"] = with_hypothesis(
+        json!({
+            "action": intent.action,
+            "objective": if intent.prune { OBJECTIVE_PRUNE } else { OBJECTIVE_REPAIR },
+            "ledger_id": ledger_id,
+            "ledger_ids": [ledger_id],
+            "began": now(),
+            "incumbent": incumbent_of(&usage["skills"][name]),
+            "incumbent_cost": incumbent_cost.to_value(),
+            "incumbent_mean": {
+                "steps": incumbent_cost.mean_steps(),
+                "tool_calls": incumbent_cost.mean_tool_calls(),
+                "output_tokens": incumbent_cost.mean_output_tokens(),
+            },
+            "edits_summary": summary,
+            "undo": undo,
+        }),
+        &intent.cause,
+        &intent.expect,
+        None,
+    );
 }
 
 /// What a trial is for: a repair of a skill that failed (`SkillOpt`, judged on
@@ -1454,7 +1544,11 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
             }
             _ => String::new(),
         };
-        update_usage(&file, |usage| close_trial(usage, name));
+        let trial = trial.clone();
+        update_usage(&file, |usage| {
+            close_trial(usage, name);
+            push_accepted(usage, name, &trial, (good, bad));
+        });
         log_revision(layers, "accepted", name, &ledger_id);
         harness_types::diag::info("skill", "revision_accepted")
             .msg(format!(
@@ -1511,6 +1605,10 @@ fn revive_absorbed(layers: &Layers, absorbed: &Value) -> String {
 /// skill changed since the revision keeps what it is, and the record says so.
 /// `costly` is why a pruned version goes back though it was not judged worse:
 /// it cost more.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the rollback, its record, its diagnostics: one revision's end"
+)]
 fn roll_back_trial(
     layers: &Layers,
     layer: Layer,
@@ -1575,12 +1673,17 @@ fn roll_back_trial(
         ),
     };
     let incumbent_cost = Cost::from_value(&trial["incumbent_cost"]);
-    let record = rejected_record(
-        "rolled_back",
-        Some(&ledger_id),
-        &reason,
-        summary,
-        &last_failure,
+    let record = with_hypothesis(
+        rejected_record(
+            "rolled_back",
+            Some(&ledger_id),
+            &reason,
+            summary,
+            &last_failure,
+        ),
+        trial["cause"].as_str().unwrap_or_default(),
+        trial["expect"].as_str().unwrap_or_default(),
+        Some((good, bad)),
     );
     update_usage(&layers.usage_file(layer, root), |usage| {
         if restored_ok {
@@ -1870,7 +1973,14 @@ pub struct LearnedSkill {
     /// so it sorts); empty when never.
     pub last_used: String,
     /// The last revisions of it that did not stand, newest last.
-    pub rejected: Vec<RejectedRevision>,
+    pub rejected: Vec<Revision>,
+    /// The last revisions of it that stood, newest last.
+    pub accepted: Vec<Revision>,
+    /// The revision on trial, as the history shows it; `None` when none is.
+    pub trial: Option<Revision>,
+    /// Whether the version the revision on trial replaced was sound
+    /// ([`incumbent_sound`]); false when none is on trial.
+    pub incumbent_sound: bool,
     /// Judged uses of the revision on trial, as `(good, bad)`; `None` when no
     /// revision is on trial.
     pub on_trial: Option<(u64, u64)>,
@@ -1888,17 +1998,150 @@ pub struct LearnedSkill {
     pub progress: Option<(usize, f64)>,
 }
 
-/// A revision of a learned skill that did not stand: the promoter refused it
-/// (`refused`), or the skill's judged uses were worse with it than with the
-/// version it replaced (`rolled_back`).
+/// A revision of a learned skill as the skill remembers it: one that did not
+/// stand (the promoter refused it, `refused`; the skill's judged uses were worse
+/// with it than with the version it replaced, `rolled_back`; a later revision
+/// replaced it while it was judged worse, `superseded`), one that did
+/// (`accepted`), or the one on trial (`on trial`).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RejectedRevision {
+pub struct Revision {
     /// RFC 3339.
     pub at: String,
     pub kind: String,
     pub reason: String,
     /// The edits, in a line: each op with the start of its target and content.
     pub edits: String,
+    /// The root cause it addressed, and what it was to do differently, as the
+    /// proposer said (SIM); empty when it said none.
+    pub cause: String,
+    pub expect: String,
+    /// The judged uses it got, as `(good, bad)`; `None` for a refused one,
+    /// which never ran.
+    pub observed: Option<(u64, u64)>,
+}
+
+impl Revision {
+    fn from_value(record: &Value, kind: &str) -> Self {
+        let text = |field: &str| record[field].as_str().unwrap_or_default().to_owned();
+        let count = |field: &str| record[field].as_u64();
+        Self {
+            at: text("at"),
+            kind: if kind.is_empty() {
+                text("kind")
+            } else {
+                kind.to_owned()
+            },
+            reason: text("reason"),
+            edits: text("edits_summary"),
+            cause: text("cause"),
+            expect: text("expect"),
+            observed: count("good").zip(count("bad")),
+        }
+    }
+
+    /// One line of the history the refiner reads.
+    fn line(&self) -> String {
+        let mut line = format!(
+            "revised {} ({})",
+            self.at.get(..10).unwrap_or(&self.at),
+            self.kind
+        );
+        let mut parts = Vec::new();
+        if !self.cause.is_empty() {
+            parts.push(format!("cause: {}", self.cause));
+        }
+        if !self.expect.is_empty() {
+            parts.push(format!("expected: {}", self.expect));
+        }
+        if let Some((good, bad)) = self.observed {
+            parts.push(format!("observed: {good} good, {bad} bad"));
+        }
+        if !self.reason.is_empty() {
+            parts.push(format!("why not kept: {}", self.reason));
+        }
+        if !self.edits.is_empty() {
+            parts.push(format!("tried: {}", self.edits));
+        }
+        if !parts.is_empty() {
+            line.push_str(": ");
+            line.push_str(&parts.join("; "));
+        }
+        line
+    }
+}
+
+/// The revisions a list of the usage record holds, in the order kept.
+fn revisions_in(records: &Value) -> Vec<Revision> {
+    records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|record| Revision::from_value(record, ""))
+        .collect()
+}
+
+/// Where a learned skill stands, from its usage record alone (GUARD,
+/// arXiv 2611.23476: a criterion that regressed is told apart from one still
+/// unsolved and from one mastered, and each is handled in its own way).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Standing {
+    /// A revision on trial failed a judged use, and the version before it was
+    /// sound: what worked is at risk.
+    Regressed,
+    /// It failed and has never worked.
+    Unsolved,
+    /// It worked at least [`MASTERED_AT`] times and has not failed since it
+    /// was last revised.
+    Mastered,
+}
+
+impl Standing {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Regressed => "regressed",
+            Self::Unsolved => "unsolved",
+            Self::Mastered => "mastered",
+        }
+    }
+}
+
+/// Judged uses that make a skill mastered.
+const MASTERED_AT: u64 = 2;
+/// The cases of a mastered skill shown to the refiner, and the longest each is.
+const WORKED_BEFORE_SHOWN: usize = 2;
+const WORKED_BEFORE_CHARS: usize = 200;
+
+impl LearnedSkill {
+    /// Its standing, `None` when it is none of the three. The trial counters
+    /// (`trial_good`, `trial_bad`) count from the skill's last write, which is
+    /// what "since its last revision" means; a skill never revised counts from
+    /// the start.
+    #[must_use]
+    pub fn standing(&self) -> Option<Standing> {
+        let usage = &self.usage;
+        if self.on_trial.is_some() && usage.trial_bad > 0 && self.incumbent_sound {
+            return Some(Standing::Regressed);
+        }
+        if usage.worked >= MASTERED_AT && usage.trial_bad == 0 {
+            return Some(Standing::Mastered);
+        }
+        (usage.failed + usage.checked_fail > 0 && usage.unproven()).then_some(Standing::Unsolved)
+    }
+
+    /// Its revision history in the order it happened, oldest first, the last
+    /// [`REVISIONS_SHOWN`]: what stood, what did not and what is on trial.
+    fn history(&self) -> Vec<&Revision> {
+        let mut all = self
+            .rejected
+            .iter()
+            .chain(&self.accepted)
+            .collect::<Vec<_>>();
+        all.sort_by(|a, b| a.at.cmp(&b.at));
+        all.extend(&self.trial);
+        let skip = all.len().saturating_sub(REVISIONS_SHOWN);
+        all.split_off(skip)
+    }
 }
 
 /// Every live learned skill, global first.
@@ -1942,21 +2185,24 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
-                rejected: raw["skills"][&name]["rejected"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|record| {
-                        let text =
-                            |field: &str| record[field].as_str().unwrap_or_default().to_owned();
-                        RejectedRevision {
-                            at: text("at"),
-                            kind: text("kind"),
-                            reason: text("reason"),
-                            edits: text("edits_summary"),
-                        }
-                    })
-                    .collect(),
+                rejected: revisions_in(&raw["skills"][&name]["rejected"]),
+                accepted: revisions_in(&raw["skills"][&name]["revisions"]),
+                trial: raw["skills"][&name]["trial"].is_object().then(|| {
+                    let trial = &raw["skills"][&name]["trial"];
+                    let count = |field: &str| raw["skills"][&name][field].as_u64().unwrap_or(0);
+                    let mut revision = Revision::from_value(trial, "on trial");
+                    trial["began"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .clone_into(&mut revision.at);
+                    trial["edits_summary"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .clone_into(&mut revision.edits);
+                    revision.observed = Some((count("trial_good"), count("trial_bad")));
+                    revision
+                }),
+                incumbent_sound: incumbent_sound(&raw["skills"][&name]["trial"]["incumbent"]),
                 on_trial: raw["skills"][&name]["trial"].is_object().then(|| {
                     let count = |field: &str| raw["skills"][&name][field].as_u64().unwrap_or(0);
                     (count("trial_good"), count("trial_bad"))
@@ -2040,7 +2286,10 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
             };
             format!("; revision on trial{prune}: {good} good, {bad} bad")
         });
-        let checks = checks + &judged + &trial;
+        let standing = skill.standing().map_or_else(String::new, |standing| {
+            format!("; status: {}", standing.as_str())
+        });
+        let checks = checks + &judged + &trial + &standing;
         let mut entry = format!(
             "- {} [{}]: {} (offered {}, activated {}, viewed {} in {seen} requests{probation}{checks})",
             skill.name,
@@ -2067,17 +2316,27 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
                 mean * 100.0
             );
         }
-        // What was tried on this skill and did not stand, newest first, so a
-        // revision is not proposed again as it was.
-        for rejected in skill.rejected.iter().rev().take(REJECTED_SHOWN) {
+        // What was tried on this skill and how each revision went, oldest
+        // first: what stood is built on, and what did not is not proposed
+        // again as it was.
+        for revision in skill.history() {
             let _ = write!(
                 entry,
-                "\n  rejected before: {} {}: {}; tried: {}",
-                rejected.kind,
-                rejected.at.get(..10).unwrap_or(&rejected.at),
-                rejected.reason,
-                rejected.edits
+                "
+  {}",
+                revision.line()
             );
+        }
+        // What a mastered skill worked in, so what must keep working is seen.
+        if skill.standing() == Some(Standing::Mastered) {
+            for case in skill.cases.iter().rev().take(WORKED_BEFORE_SHOWN).rev() {
+                let _ = write!(
+                    entry,
+                    "
+  worked before: {}",
+                    one_line(case, WORKED_BEFORE_CHARS)
+                );
+            }
         }
         groups
             .entry(skill.category.as_str())
@@ -2544,6 +2803,11 @@ pub struct Intent {
     pub absorbed_into: Option<String>,
     pub reason: String,
     pub evidence: String,
+    /// The root-cause hypothesis a revision addresses, in a sentence (SIM,
+    /// arXiv 2611.18856), and what following the revised skill should do
+    /// differently. Optional: kept with the revision's trial and records.
+    pub cause: String,
+    pub expect: String,
     /// The intent is a prune (`EfficientSkill`'s second phase), made by the host's
     /// prune pass and never read from what the model wrote: it must leave
     /// `SKILL.md` shorter, and the trial it opens is held to cost as well.
@@ -2594,6 +2858,8 @@ impl Intent {
             absorbed_into: text("absorbed_into").filter(|name| !name.is_empty()),
             reason: text("reason").unwrap_or_default(),
             evidence: text("evidence").unwrap_or_default(),
+            cause: text("cause").unwrap_or_default(),
+            expect: text("expect").unwrap_or_default(),
             prune: false,
         }
     }
@@ -3622,11 +3888,13 @@ Create skills at the altitude of the class of work (`rust-test-debugging`, not `
 
 Revise in small steps: change an existing learned skill with the `edit` action, a list of at most {edit_budget} changes applied in order to the live SKILL.md: {"op":"append","content":"..."} adds at the end; {"op":"insert_after","target":"...","content":"..."} puts content after `target`; {"op":"replace","target":"...","content":"..."} swaps `target` for content; {"op":"delete","target":"..."} removes it. A `target` is an exact quote that occurs exactly once (as the edits before it left the text); one that is missing or occurs more than once refuses the whole intent, naming the edit. One refinement may make at most {edit_budget} edits to one skill, summed over all its intents, and a `patch` is one edit: choose the changes that matter most and leave the rest for a later refinement. A whole `update` of a skill that has been seen to work (a review judged it worked, or a check passed after it) is refused: use `edit`. `update` is for a skill not yet seen to work.
 
-A revision is on trial. The version it replaced is kept: when the skill's next judged uses go worse with the revision (two bad, and more bad than good), the host puts the earlier version back; the revision is kept for good once they go better (two good, and more good than bad), and a tie leaves the trial open. Under <learned_skills>, "rejected before" lines are revisions of that skill that were refused or rolled back, with why and what was tried: do not propose the same change again.
+A revision is on trial. The version it replaced is kept: when the skill's next judged uses go worse with the revision (two bad, and more bad than good), the host puts the earlier version back; the revision is kept for good once they go better (two good, and more good than bad), and a tie leaves the trial open. Say with every `edit`, `patch` or `update` of an existing skill what it rests on: `cause` is the root cause of the failure or gap it addresses, in one sentence, and `expect` is what following the revised skill should now do differently, in one sentence. The host keeps both with the revision and, later, how its judged uses went. Under <learned_skills>, each "revised" line is one earlier revision of that skill, oldest first: its date, how it ended (accepted, on trial, rolled_back, refused or superseded), the cause it addressed, what it expected, how its judged uses went (observed), and for one that did not stand, why (reason). A rolled_back, refused or superseded revision did not stand, and "tried" is what it changed: do not propose the same change again, and when its cause was right but its change was wrong, address the same cause another way. An accepted revision stands: build on it, do not undo it.
+
+A learned skill under <learned_skills> may carry a status, computed from its judged uses. `regressed`: its revision on trial failed a judged use while the version before it was sound; narrow when the new text applies - add a condition ("When <condition>: ...") around the changed steps - instead of rewriting what the earlier version did. `mastered`: it worked at least twice and has not failed since it was last revised; edit it only to add, never to remove or replace a step that its "worked before" lines (uses it worked in) rely on. `unsolved`: it failed and never worked; it may be rewritten.
 
 "checks after use" under <learned_skills> counts turns that used the skill and then ran the project's verification checks, by how they ended. Repeated fails after use make a skill a candidate to fix: patch the step the failing work followed, or, when it passes in some situations and fails in others, split it into variants whose descriptions name when each applies. Never delete a skill because checks failed after it: a failure can come from the task, not the skill, and a skill that helps only in some contexts averages out to no effect while still being worth keeping.
 
-Intent fields: {"action":"create|update|patch|edit|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","edits":[{"op":"append|insert_after|replace|delete","target":"exact text that occurs once (not for append)","content":"the text to add or put in its place (not for delete)"}],"files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","script_runs":[{"path":"scripts/<name>","evidence":"a verbatim quote of the result of running it"}],"reason":"why","evidence":"a verbatim quote from the conversation"}
+Intent fields: {"action":"create|update|patch|edit|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","edits":[{"op":"append|insert_after|replace|delete","target":"exact text that occurs once (not for append)","content":"the text to add or put in its place (not for delete)"}],"files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","script_runs":[{"path":"scripts/<name>","evidence":"a verbatim quote of the result of running it"}],"reason":"why","evidence":"a verbatim quote from the conversation","cause":"edit/patch/update of an existing skill, optional: the root cause it addresses, one sentence","expect":"edit/patch/update, optional: what following the revised skill should now do differently, one sentence"}
 
 Format, enforced:
 - SKILL.md opens with front matter: `---`, `name: <the intent name>`, `description: <one sentence that says when to use it, trigger first>`, `category: <one lowercase word or hyphenated phrase, reusing an existing category>`, `---`.
@@ -5395,11 +5663,11 @@ mod tests {
         let overview = library_overview(&skills);
         let lines = overview
             .lines()
-            .filter(|line| line.trim_start().starts_with("rejected before: refused "))
+            .filter(|line| line.trim_start().starts_with("revised ") && line.contains("(refused)"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "{overview}");
         assert!(
-            lines[0].contains("target 6 ") && lines[0].contains("tried: replace \"old 6\""),
+            lines[2].contains("target 6 ") && lines[2].contains("tried: replace \"old 6\""),
             "{overview}"
         );
         assert!(!overview.contains("target 3 "), "{overview}");
@@ -5414,7 +5682,10 @@ mod tests {
             "at most 4 changes",
             "at most 4 edits to one skill",
             "A whole `update` of a skill that has been seen to work",
-            "rejected before",
+            "revised",
+            "`regressed`",
+            "`mastered`",
+            "`cause`",
             "\"action\":\"create|update|patch|edit|remove_file|delete\"",
         ] {
             assert!(spec.contains(needle), "{needle}");
@@ -6250,5 +6521,374 @@ mod tests {
         assert!(prune_enabled(&environment(Some("on"))));
         assert!(!prune_enabled(&environment(Some("off"))));
         assert!(!prune_enabled(&environment(Some(" OFF "))));
+    }
+
+    // -----------------------------------------------------------------------
+    // The revision memory (SIM) and a skill's standing (GUARD)
+
+    fn edit_for(name: &str, content: &str, cause: &str, expect: &str) -> Intent {
+        Intent::from_value(&json!({
+            "action": "edit", "name": name,
+            "edits": [{"op": "append", "content": content}],
+            "reason": "the user corrected the approach", "evidence": "[User]: do it this way",
+            "cause": cause, "expect": expect,
+        }))
+    }
+
+    fn seed(layers: &Layers, name: &str, record: serde_json::Value) {
+        let root = layers.project.clone().expect("project");
+        super::update_usage(&layers.usage_file(Layer::Project, &root), |usage| {
+            usage["skills"][name] = record;
+        });
+    }
+
+    fn history_lines(overview: &str) -> Vec<&str> {
+        overview
+            .lines()
+            .filter(|line| line.trim_start().starts_with("revised "))
+            .collect()
+    }
+
+    #[test]
+    fn a_revisions_cause_and_expectation_live_in_its_trial_and_its_history_line() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let landed = promote(
+            &layers,
+            &edit_for(
+                "deploy",
+                "Free the port first.",
+                "the port was still in use",
+                "the script frees the port before it starts",
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(trial["cause"], "the port was still in use");
+        assert_eq!(
+            trial["expect"],
+            "the script frees the port before it starts"
+        );
+        // A second change in the same refinement joins the revision, and its
+        // cause is told with the first.
+        let second = promote(
+            &layers,
+            &edit_for(
+                "deploy",
+                "Check the exit code.",
+                "the exit code was ignored",
+                "",
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(second.ok, "{:?}", second.findings);
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(
+            trial["cause"],
+            "the port was still in use; the exit code was ignored"
+        );
+        assert_eq!(
+            trial["expect"],
+            "the script frees the port before it starts"
+        );
+        let overview = library_overview(&library(&layers));
+        let lines = history_lines(&overview);
+        assert_eq!(lines.len(), 1, "{overview}");
+        assert!(
+            lines[0].contains("(on trial): cause: the port was still in use; the exit code was ignored; expected: the script frees the port before it starts; observed: 0 good, 0 bad; tried: "),
+            "{overview}"
+        );
+        // Two good uses accept it: kept in the history, with the counts.
+        record_outcome(&layers, "deploy", true, "", "it shipped again");
+        record_outcome(&layers, "deploy", true, "", "it shipped a third time");
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        let kept = &raw["skills"]["deploy"]["revisions"];
+        assert_eq!(kept.as_array().map(Vec::len), Some(1), "{kept}");
+        assert_eq!(kept[0]["kind"], "accepted");
+        assert_eq!(kept[0]["ledger_id"], second.undo["ledger_id"]);
+        assert_eq!(
+            kept[0]["cause"],
+            "the port was still in use; the exit code was ignored"
+        );
+        assert_eq!(
+            (kept[0]["good"].as_u64(), kept[0]["bad"].as_u64()),
+            (Some(2), Some(0))
+        );
+        assert!(
+            kept[0]["edits_summary"]
+                .as_str()
+                .expect("summary")
+                .contains("append")
+        );
+        let overview = library_overview(&library(&layers));
+        let lines = history_lines(&overview);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("(accepted): cause: the port was still in use")
+                && lines[0].contains("observed: 2 good, 0 bad"),
+            "{overview}"
+        );
+        assert!(!overview.contains("rejected before"), "{overview}");
+    }
+
+    #[test]
+    fn a_rolled_back_a_superseded_and_a_refused_revision_keep_their_cause_and_counts() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        // Rolled back after two bad uses.
+        let landed = promote(
+            &layers,
+            &edit_for(
+                "deploy",
+                "Use --fast.",
+                "the deploy was slow",
+                "it deploys faster",
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        record_outcome(&layers, "deploy", false, "--fast exists", "unknown flag");
+        record_outcome(&layers, "deploy", false, "--fast exists", "unknown flag");
+        // Superseded: one bad use, then a fix.
+        let landed = promote(
+            &layers,
+            &edit_for(
+                "deploy",
+                "Use --quick.",
+                "the deploy was slow",
+                "it deploys faster",
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        record_outcome(&layers, "deploy", false, "--quick exists", "unknown flag");
+        let landed = promote(
+            &layers,
+            &edit_for(
+                "deploy",
+                "Use --lean.",
+                "the flag name was wrong",
+                "the flag works",
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(trial["cause"], "the flag name was wrong", "{trial}");
+        // Refused: the promoter will not take it.
+        let refused = Intent::from_value(&json!({
+            "action": "edit", "name": "deploy",
+            "edits": [{"op": "replace", "target": "no such text", "content": "x"}],
+            "reason": "r", "evidence": "e",
+            "cause": "the target was wrong", "expect": "a target that exists",
+        }));
+        assert!(super::record_refused(
+            &layers,
+            &refused,
+            "shape: edits[0] target is not in SKILL.md"
+        ));
+        let raw = raw_usage(&layers);
+        let rejected = raw["skills"]["deploy"]["rejected"]
+            .as_array()
+            .expect("rejected");
+        let kinds = rejected
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            ["rolled_back", "superseded", "refused"],
+            "{rejected:?}"
+        );
+        assert_eq!(rejected[0]["cause"], "the deploy was slow");
+        assert_eq!(rejected[0]["expect"], "it deploys faster");
+        assert_eq!(
+            (rejected[0]["good"].as_u64(), rejected[0]["bad"].as_u64()),
+            (Some(0), Some(2))
+        );
+        assert_eq!(rejected[1]["cause"], "the deploy was slow");
+        assert_eq!(
+            (rejected[1]["good"].as_u64(), rejected[1]["bad"].as_u64()),
+            (Some(0), Some(1))
+        );
+        assert_eq!(rejected[2]["cause"], "the target was wrong");
+        assert!(
+            rejected[2]["good"].is_null(),
+            "a refused revision never ran"
+        );
+        // Four revisions, the last three shown, the one on trial last.
+        let overview = library_overview(&library(&layers));
+        let lines = history_lines(&overview);
+        assert_eq!(lines.len(), 3, "{overview}");
+        assert!(
+            lines[0].contains("(superseded): cause: the deploy was slow; expected: it deploys faster; observed: 0 good, 1 bad; why not kept: replaced by a later revision"),
+            "{overview}"
+        );
+        assert!(
+            lines[1].contains("(refused): cause: the target was wrong; expected: a target that exists; why not kept: shape:")
+                && !lines[1].contains("observed"),
+            "{overview}"
+        );
+        assert!(
+            lines[2].contains("(on trial): cause: the flag name was wrong"),
+            "{overview}"
+        );
+        assert!(!overview.contains("rejected before"), "{overview}");
+    }
+
+    #[test]
+    fn the_accepted_history_keeps_the_last_five() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        for round in 0..7 {
+            let landed = promote(
+                &layers,
+                &edit_for(
+                    "deploy",
+                    &format!("Rule {round}."),
+                    &format!("cause {round}"),
+                    "",
+                ),
+                &PromoteContext::default(),
+            );
+            assert!(landed.ok, "{:?}", landed.findings);
+            record_outcome(&layers, "deploy", true, "", &format!("shipped {round}"));
+            record_outcome(&layers, "deploy", true, "", &format!("again {round}"));
+        }
+        let raw = raw_usage(&layers);
+        let kept = raw["skills"]["deploy"]["revisions"]
+            .as_array()
+            .expect("revisions");
+        assert_eq!(kept.len(), super::REVISIONS_KEPT);
+        assert_eq!(kept[0]["cause"], "cause 2");
+        assert_eq!(kept[4]["cause"], "cause 6");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "nine skills and what each is told, read top to bottom"
+    )]
+    fn a_skill_is_regressed_unsolved_or_mastered_by_its_usage_record() {
+        use super::Standing;
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let cases = json!([
+            {"at": "2026-11-01T00:00:00Z", "evidence": "first case"},
+            {"at": "2026-11-02T00:00:00Z", "evidence": "second case"},
+            {"at": "2026-11-03T00:00:00Z", "evidence": "third case"},
+        ]);
+        let trial = |worked: u64| {
+            json!({"ledger_id": "chg-1", "began": "2026-11-04T00:00:00Z", "action": "edit",
+                "incumbent": {"worked": worked, "failed": 0, "checked_pass": 0, "checked_fail": 0, "trial_good": 0, "trial_bad": 0},
+                "edits_summary": "append", "undo": {}})
+        };
+        let records = [
+            // Worked three times, never failed.
+            (
+                "mastered",
+                json!({"worked": 3, "trial_good": 3, "cases": cases}),
+            ),
+            // Worked twice, then failed once since it was last revised.
+            (
+                "slipped",
+                json!({"worked": 2, "failed": 1, "trial_good": 2, "trial_bad": 1}),
+            ),
+            // Worked once only.
+            ("young", json!({"worked": 1, "trial_good": 1})),
+            // A revision on trial failed a use, and the incumbent had worked.
+            (
+                "regressed",
+                json!({"worked": 2, "failed": 1, "trial_bad": 1, "trial": trial(2)}),
+            ),
+            // A revision on trial with only good uses so far.
+            (
+                "promising",
+                json!({"worked": 1, "trial_good": 1, "trial": trial(1)}),
+            ),
+            // A revision on trial failed, but the incumbent never worked.
+            (
+                "hopeless",
+                json!({"failed": 1, "trial_bad": 1, "trial": trial(0)}),
+            ),
+            // Failed, never worked.
+            ("unsolved", json!({"failed": 2, "trial_bad": 2})),
+            // Failed, but a check passed after it.
+            (
+                "checked",
+                json!({"failed": 1, "checked_pass": 1, "trial_bad": 1}),
+            ),
+            // Mastered, then revised: the revision has not failed since.
+            (
+                "revised",
+                json!({"worked": 3, "trial_good": 0, "trial_bad": 0, "trial": trial(3)}),
+            ),
+        ];
+        for (name, record) in &records {
+            land_skill(&layers, name, "Run it.");
+            seed(&layers, name, record.clone());
+        }
+        let skills = library(&layers);
+        let standing = |name: &str| {
+            skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .expect("skill")
+                .standing()
+        };
+        assert_eq!(standing("mastered"), Some(Standing::Mastered));
+        assert_eq!(standing("slipped"), None);
+        assert_eq!(standing("young"), None);
+        assert_eq!(standing("regressed"), Some(Standing::Regressed));
+        assert_eq!(standing("promising"), None);
+        assert_eq!(standing("hopeless"), Some(Standing::Unsolved));
+        assert_eq!(standing("unsolved"), Some(Standing::Unsolved));
+        assert_eq!(standing("checked"), None);
+        assert_eq!(standing("revised"), Some(Standing::Mastered));
+        // The overview carries the status, and only a mastered skill its cases.
+        let overview = library_overview(&skills);
+        let entry = |name: &str| {
+            overview
+                .split("\n- ")
+                .find(|entry| {
+                    entry
+                        .trim_start_matches("- ")
+                        .starts_with(&format!("{name} ["))
+                })
+                .map(str::to_owned)
+                .expect("entry")
+        };
+        assert!(
+            entry("mastered").contains("; status: mastered"),
+            "{overview}"
+        );
+        assert!(
+            entry("regressed").contains("; status: regressed"),
+            "{overview}"
+        );
+        assert!(
+            entry("unsolved").contains("; status: unsolved"),
+            "{overview}"
+        );
+        assert!(!entry("slipped").contains("status:"), "{overview}");
+        let mastered = entry("mastered");
+        let worked_before = mastered
+            .lines()
+            .filter(|line| line.trim_start().starts_with("worked before: "))
+            .collect::<Vec<_>>();
+        assert_eq!(worked_before.len(), 2, "{mastered}");
+        assert!(
+            worked_before[0].contains("second case") && worked_before[1].contains("third case"),
+            "{mastered}"
+        );
+        assert!(!entry("regressed").contains("worked before"), "{overview}");
+        assert!(!entry("unsolved").contains("worked before"), "{overview}");
     }
 }

@@ -680,11 +680,16 @@ fn modifies(segment: &Segment) -> bool {
 /// The workspace is the agent's to change even when it sits inside a
 /// protected directory - a coder's worktree lives in ha's state - so inside
 /// it only a protected directory that is itself inside it (`.harness`)
-/// counts.
-fn protected_write(segment: &Segment, root: &Path, protected: &[PathBuf]) -> Option<String> {
+/// counts. A relative path is the one `dir`, where the command runs, names.
+fn protected_write(
+    segment: &Segment,
+    root: &Path,
+    dir: &Path,
+    protected: &[PathBuf],
+) -> Option<String> {
     let inside = |word: &String| {
         literal(word) && {
-            let path = absolute(root, word);
+            let path = absolute(dir, word);
             let in_workspace = same_or_inside(&path, root);
             protected.iter().any(|base| {
                 same_or_inside(&path, base) && (!in_workspace || same_or_inside(base, root))
@@ -700,9 +705,12 @@ fn protected_write(segment: &Segment, root: &Path, protected: &[PathBuf]) -> Opt
 }
 
 /// What a recursive delete's targets come to: every one can be had back, or
-/// the reason one cannot.
+/// the reason one cannot. A relative target is the one `dir`, where the command
+/// runs, names: it used to be read from the workspace root, whichever directory
+/// the command ran in.
 async fn delete_refusal(
     root: &Path,
+    dir: &Path,
     targets: &[String],
     relocated: bool,
     cancellation: &harness_providers::CancellationToken,
@@ -738,7 +746,7 @@ async fn delete_refusal(
                 "the command changes directory first, so where `{target}` points cannot be checked"
             ));
         }
-        let path = absolute(root, target);
+        let path = absolute(dir, target);
         // Outside the workspace nothing is the agent's to remove: the system's
         // temporary folder holds other programs' files too.
         if !same_or_inside(&path, root) {
@@ -798,21 +806,24 @@ async fn delete_refusal(
 }
 
 /// Why `command`, a shell command line, must not run; `None` when every guard
-/// lets it through.
+/// lets it through. The command runs in `dir` (the root, or where an earlier
+/// shell call left off inside it), which its relative paths are read from.
 pub(crate) async fn shell_refusal(
     root: &Path,
+    dir: &Path,
     command: &str,
     protected: &[PathBuf],
     cancellation: harness_providers::CancellationToken,
     spool: &crate::capture::ProcessSpoolConfig,
 ) -> Option<Refusal> {
     let segments = parse(command);
-    judge(root, &segments, protected, &cancellation, spool).await
+    judge(root, dir, &segments, protected, &cancellation, spool).await
 }
 
 /// Why a program and its arguments, run without a shell, must not run.
 pub(crate) async fn process_refusal(
     root: &Path,
+    dir: &Path,
     executable: &str,
     args: &[String],
     protected: &[PathBuf],
@@ -827,11 +838,12 @@ pub(crate) async fn process_refusal(
     };
     // `powershell -Command ...` run without a shell is still a shell.
     let segments = expand(vec![segment], 0);
-    judge(root, &segments, protected, &cancellation, spool).await
+    judge(root, dir, &segments, protected, &cancellation, spool).await
 }
 
 async fn judge(
     root: &Path,
+    dir: &Path,
     segments: &[Segment],
     protected: &[PathBuf],
     cancellation: &harness_providers::CancellationToken,
@@ -876,7 +888,7 @@ async fn judge(
         {
             return Some(refused);
         }
-        if let Some(path) = protected_write(segment, root, &protected)
+        if let Some(path) = protected_write(segment, root, dir, &protected)
             && let Some(refused) = refusal(
                 "harness-integrity",
                 ALLOW_HARNESS_WRITES,
@@ -889,7 +901,8 @@ async fn judge(
         }
         if let Some(targets) = recursive_delete(segment)
             && !lifted(ALLOW_RECURSIVE_DELETE)
-            && let Some(why) = delete_refusal(root, &targets, relocated, cancellation, spool).await
+            && let Some(why) =
+                delete_refusal(root, dir, &targets, relocated, cancellation, spool).await
         {
             return refusal(
                 "recursive-delete",
@@ -1067,7 +1080,7 @@ mod tests {
         let write = |command: &str| {
             parse(command)
                 .into_iter()
-                .find_map(|segment| protected_write(&segment, root, &protected))
+                .find_map(|segment| protected_write(&segment, root, root, &protected))
         };
         assert!(write("echo x > .harness/features.json").is_some());
         assert!(write("Set-Content /home/u/.config/ha/config.toml x").is_some());
@@ -1086,7 +1099,7 @@ mod tests {
         let write = |command: &str| {
             parse(command)
                 .into_iter()
-                .find_map(|segment| protected_write(&segment, &worktree, &protected))
+                .find_map(|segment| protected_write(&segment, &worktree, &worktree, &protected))
         };
         assert!(write("echo x > src/main.rs").is_none());
         assert!(write("rm notes.md").is_none());
@@ -1158,6 +1171,7 @@ mod tests {
             async move {
                 shell_refusal(
                     &root,
+                    &root,
                     command,
                     &[],
                     harness_providers::CancellationToken::new(),
@@ -1196,5 +1210,76 @@ mod tests {
                 .contains("whole workspace")
         );
         assert!(reason.contains(ALLOW_RECURSIVE_DELETE));
+    }
+
+    /// A shell call that kept `cd src` from the one before runs in `src`: its
+    /// `old` is `src/old`. The guards read it from the workspace root, where
+    /// `old` is no folder at all, so a delete of untracked work passed.
+    #[tokio::test]
+    async fn a_relative_path_is_read_from_the_directory_the_command_runs_in() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("w");
+        std::fs::create_dir_all(root.join("src/old")).expect("dirs");
+        std::fs::create_dir_all(root.join(".harness")).expect("harness");
+        std::fs::write(root.join("src/old/a.rs"), "a").expect("file");
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "a"]);
+        std::fs::write(root.join("src/old/b.rs"), "new").expect("untracked");
+        let spool = spool(dir.path());
+        let refused = |from: PathBuf, command: &'static str| {
+            let root = root.clone();
+            let spool = spool.clone();
+            async move {
+                shell_refusal(
+                    &root,
+                    &from,
+                    command,
+                    &[],
+                    harness_providers::CancellationToken::new(),
+                    &spool,
+                )
+                .await
+                .map(|refusal| refusal.reason)
+            }
+        };
+        let reason = refused(root.join("src"), "rm -rf old")
+            .await
+            .expect("refused");
+        assert!(
+            reason.contains("could not give back") && reason.contains("b.rs"),
+            "{reason}"
+        );
+        assert_eq!(
+            refused(root.clone(), "rm -rf old").await,
+            None,
+            "from the root, `old` names nothing"
+        );
+        let reason = refused(root.join("src"), "rm -rf ../../elsewhere")
+            .await
+            .expect("refused");
+        assert!(reason.contains("outside the workspace"), "{reason}");
+        assert!(
+            refused(root.join(".harness"), "echo x > features.json")
+                .await
+                .is_some_and(|reason| reason.contains(ALLOW_HARNESS_WRITES))
+        );
+        assert_eq!(
+            refused(root.clone(), "echo x > features.json").await,
+            None,
+            "from the root, it is a file of the workspace"
+        );
+        // A program started without a shell is read the same way.
+        let refusal = process_refusal(
+            &root,
+            &root.join("src"),
+            "rm",
+            &["-rf".to_owned(), "old".to_owned()],
+            &[],
+            harness_providers::CancellationToken::new(),
+            &spool,
+        )
+        .await;
+        assert!(refusal.is_some());
     }
 }

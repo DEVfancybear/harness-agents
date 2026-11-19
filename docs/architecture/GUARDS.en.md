@@ -106,6 +106,76 @@ turn and by `ha exec`, so a child's tools guard them too. A coder's worktree
 lives in ha's state directory; inside the workspace only `.harness` counts, so a
 child changes its own worktree freely.
 
+**Where a command runs.** Every `run_shell` and `run_process` call used to start at
+the workspace root with the host's `PATH`, so a `cd sub` (or `Set-Location sub`)
+in one call was lost by the next, and the model ran the next command in the wrong
+place. The Python REPL kept `os.chdir`; the shell did not. arXiv 2611.22299,
+*Harnesses That Improve Themselves*, lists a persistent shell location among the
+runtime mechanisms that self-evolving harnesses keep inventing. Now
+(`processes/location.rs`):
+
+- The host puts a recording in front of each `run_shell` command, never after it
+  (text appended to a command is read as part of it: an unterminated heredoc or
+  a trailing backslash swallowed it, and a command that exits itself never
+  reached it). It writes the shell's final directory and `PATH` to a side file
+  the host chose in the process spool (never to stdout) when the shell exits,
+  however it does, and leaves the status as the command made it:
+  - `sh`: an `EXIT` trap that saves `$?`, writes `pwd` and `$PATH`, and exits
+    with the saved status. A command that sets its own `EXIT` trap replaces
+    ours: no location is kept for it (the old behavior). A syntax error leaves
+    the place where the call started.
+  - `pwsh` and `powershell.exe`: a `PowerShell.Exiting` engine event registered
+    first (it runs on `exit N` too, on PowerShell 7 and 5.1), and a status
+    line after the command and a blank line. Measured on both: `-Command` exits
+    0 when the last statement succeeded, 1 when it failed (a native program's own
+    code is lost) and N for `exit N`. The status line exits 0 on success, the
+    native program's `$LASTEXITCODE` when the command failed and it is a
+    non-zero integer, else 1; so a native `exit 5` now gives 5 (it gave 1), a
+    success stays 0, and `exit N` stays N. A command that does not parse runs
+    nothing, so the place stays.
+  - A command that is killed, times out or is canceled writes no file, so the
+    place stays as it was.
+- The host keeps, per conversation (task), the last directory and `PATH`; the
+  next `run_shell` and `run_process` of that conversation start there.
+- The calls of one conversation take turns: a call reads its start place and
+  stores its end place while it holds the conversation's lock, after any call
+  before it has stored its own. It used to read the place before it held the
+  process permit, so two calls that ran together could store the old place over
+  the new one. (A turn's batch already runs `run_shell` and `run_process` one at
+  a time; this holds when they do not, and the Python REPL's `bash()` does not
+  read or change the place.)
+- The directory is kept only when it is inside the workspace root once resolved
+  (a link out of it does not count). Outside it, the next call starts at the root
+  and the result says so in one line. `PATH` is kept only when it differs from
+  the host's. No other variable is kept: an environment carries secrets.
+- The kept `PATH` is only what the command runs with. The shell is found in the
+  host's own `PATH` and started by its full path, so a call that emptied `PATH`
+  does not leave the next one without a shell. A `run_process` of a program named
+  bare is looked up in the kept `PATH` and, when it is not there, does not start
+  (`the program did not start ... it is not on the PATH an earlier shell call
+  set; nothing ran`), as a shell with that `PATH` would say. Windows would
+  otherwise have found it in the host's `PATH` too.
+- Jev's command guard judges a call at the gate, before the approval, from where
+  the shell is at that moment. The conversation's lock cannot be held from there
+  to the dispatch (the guard is a model call and the approval waits for a
+  person), so the dispatch, holding the lock, compares the directory it starts in
+  with the one the guard judged and, when they differ (a call of the conversation
+  ran in between), asks the guard again from the right one. A refusal then is
+  returned as the call's result; the command is never run on a verdict given for
+  another directory.
+- The guards above read a relative path from the directory the command runs in,
+  not from the root: `recursive-delete` (a delete of untracked work named from
+  the kept folder is refused; read from the root it named nothing and passed),
+  `harness-integrity`, the destructive-git guard (its `git status` runs there)
+  and Jev's command guard (`working_dir`, and the scripts it reads). A `cd`
+  inside the same command still leaves the targets after it unchecked, as before.
+  The file lists of a compaction summary read a relative word of a command from
+  the folder its result names.
+- The result says where the command ran when that was not the root (`ran in
+  sub`) and, when the command moved, where the next one starts.
+- `HA_SHELL_KEEP_LOCATION=off` restores the old behaviour: every call starts at
+  the root with the host's `PATH`.
+
 ## 4. Key-shaped values
 
 `secret_values` recognizes:

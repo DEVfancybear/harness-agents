@@ -1,6 +1,6 @@
 # Đổi chiến lược và runtime harness
 
-Phần ha lấy từ hai bài báo: nó hoạt động thế nào, và phần nào không lấy.
+Phần ha lấy từ các bài báo: nó hoạt động thế nào, và phần nào không lấy.
 
 - **[A] arXiv 2608.19072**, *What Is Missing from AI Post-Training AI*: agent
   thực thi tốt nhưng khoá cứng vào chiến lược ban đầu. Chỉ 2,1% số lần thử
@@ -102,6 +102,37 @@ quyết định) và `crates/harness-cli/src/host/coordination/goal.rs` (nơi go
   bắt người dùng phải chọn.
 - **Review đọc bản ghi chiến lược** cùng cuộc trò chuyện, để chiến lược đã
   giậm chân trở thành bài học cho task sau.
+
+## Hồi phục sau step rỗng ([C])
+
+- **[C] arXiv 2611.22299**, *Harnesses That Improve Themselves*, liệt kê các cơ chế
+  runtime mà những harness tự tiến hoá cứ phải tự nghĩ ra. Còn thiếu hai cơ chế:
+  hồi phục sau một lượt rỗng (mục này) và một shell giữ được chỗ lần gọi trước để
+  lại ([guards](GUARDS.vi.md), "Lệnh chạy ở đâu").
+
+Một step mà reply không có chữ nào và không gọi tool nào trước đây bị coi là câu
+trả lời cuối của turn: người dùng nhận một câu trả lời rỗng và turn kết thúc, kể cả
+khi model chỉ đang kẹt (phần suy luận của nó có thể dài). Nay, trong chuỗi chạy khi
+một step không gọi tool (`crates/harness-tools/src/runtime/turn_driver.rs`), sau tin
+nhắn điều hướng người dùng gửi và trước stop hook, nhắc kiểm tra (verify reminder) và tự
+đánh giá, một step rỗng được cho chạy tiếp, **một lần mỗi turn**:
+
+- Điều kiện: reply không có chữ, không có tool call, còn step (`HA_TURN_MAX_STEPS`)
+  và chưa bị huỷ. Khi có goal thì reply rỗng vốn đã không được nhận là câu trả lời
+  (evaluator coi là chưa xác minh), nên ở đó không có gì đổi.
+- Model nhận một tin nhắn của host với vai user (lưu bằng `record_host_message`,
+  như verify reminder): *Your last reply had no text and called no tool. Continue
+  the task from where it stands: call the tool needed next, or give the answer.*
+  Nếu phần suy luận của step đó không rỗng thì 600 ký tự cuối của nó (cắt ở ranh
+  giới ký tự) đi kèm, để model thấy mình đã dừng ở đâu.
+- Người dùng thấy một thông báo (`the last reply had no text and no tool call;
+  asking the model to continue`), và diagnostics có một bản ghi `turn` /
+  `empty_step_continued` với `step` và `had_reasoning`.
+- Step rỗng thứ hai trong cùng turn kết thúc turn như trước.
+
+Không thể ép một model thật tạo ra step rỗng, nên bộ live
+(`scripts/testing/live-tests/runtime-gaps.sh`) chỉ báo số bản ghi này mà các lần
+chạy của nó sinh ra. Unit test chạy vòng lặp turn thật với model giả lập.
 
 ## Tắt
 

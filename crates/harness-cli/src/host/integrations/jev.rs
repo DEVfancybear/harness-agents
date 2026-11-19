@@ -1068,6 +1068,7 @@ impl harness_tools::ToolGuard for JevDecisions {
         &'a self,
         action: &'a CodingToolAction,
         workspace_root: &'a str,
+        working_dir: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async move {
             if !self.decides("commands") {
@@ -1083,11 +1084,16 @@ impl harness_tools::ToolGuard for JevDecisions {
                     .join(" "),
                 _ => return None,
             };
-            let state = json!({
+            let mut state = json!({
                 "command": command,
-                "scripts": scripts_of(action, workspace_root),
+                "scripts": scripts_of(action, working_dir),
                 "project_folder": workspace_root,
             });
+            // Where the command starts, when an earlier call left it inside a folder
+            // of the project.
+            if working_dir != workspace_root {
+                state["working_dir"] = json!(working_dir);
+            }
             let mut questions = Map::new();
             questions.insert("verdict".to_owned(), json!({
                 "type": "choice",
@@ -2097,27 +2103,37 @@ mod tests {
         }))
         .await;
         let guard = decisions(endpoint.clone(), &[]);
-        let refused = guard.check(&shell("python steal.py"), &root).await;
+        let refused = guard.check(&shell("python steal.py"), &root, &root).await;
         assert!(
             refused
                 .as_deref()
                 .is_some_and(|reason| reason.contains("deny, confidence 0.99")),
             "{refused:?}"
         );
-        assert!(guard.check(&shell("cargo test"), &root).await.is_none());
         assert!(
-            guard.check(&shell("echo unsure"), &root).await.is_none(),
+            guard
+                .check(&shell("cargo test"), &root, &root)
+                .await
+                .is_none()
+        );
+        assert!(
+            guard
+                .check(&shell("echo unsure"), &root, &root)
+                .await
+                .is_none(),
             "an unsure deny runs"
         );
         let off = decisions(endpoint, &["commands"]);
         assert!(
-            off.check(&shell("python steal.py"), &root).await.is_none(),
+            off.check(&shell("python steal.py"), &root, &root)
+                .await
+                .is_none(),
             "switched off"
         );
         let unreachable = decisions("http://127.0.0.1:9/v1/systemone".to_owned(), &[]);
         assert!(
             unreachable
-                .check(&shell("python steal.py"), &root)
+                .check(&shell("python steal.py"), &root, &root)
                 .await
                 .is_none(),
             "fails open"
@@ -2152,7 +2168,7 @@ mod tests {
                 .await;
                 let guard = decisions(endpoint, &[]);
                 for command in ["echo plain", "echo sure", "rm unsure", "steal keys"] {
-                    refused.push(guard.check(&shell(command), &root).await.is_some());
+                    refused.push(guard.check(&shell(command), &root, &root).await.is_some());
                 }
             });
         });

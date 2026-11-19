@@ -224,6 +224,7 @@ Các tính năng này nằm trong `harness-cli` như tính năng tầng ứng d�
 - **Session log.** Mỗi hội thoại một log được chọn lọc, do host ghi bằng một lần gọi model từ journal: những gì đã quyết, đã học, đã sửa, đã đổi và còn phải làm. Hội thoại mới được kể về log mới nhất, và `/recall` đọc chúng (`host/memory/session_log.rs`; [session continuity](SESSION_CONTINUITY.vi.md)).
 - **Sleep và Deep Dream.** Mọi lượt memory chạy nền (review của một hội thoại, consolidation theo lô của Deep Dream, evolution của harness, lượt hết hạn) trước hết là một job trên đĩa dưới `<data>/sleep/`, được thử lại sau một thời gian chờ và bỏ cuộc sau một số lần hỏng (`host/memory/sleep.rs`; [Sleep](SLEEP.vi.md)).
 - **Tự đánh giá.** Turn đã làm đủ việc được chấm trên năm trục chất lượng bằng một lần gọi model của host, sau lời nhắc kiểm tra; `/self-eval` yêu cầu nó bằng tay, và mỗi lần đánh giá là một dòng trong `evaluations.jsonl` ([tự đánh giá](SELF_EVALUATION.vi.md)).
+- **Điều review được báo trước khi lên kế hoạch lần nữa.** Các sửa đổi memory và prompt mà host từ chối được giữ theo từng scope và hiện cho planner kế tiếp; mỗi learned skill được đánh dấu regressed, unsolved hoặc mastered, và giữ nguyên nhân cùng kỳ vọng của các bản sửa thành một lịch sử (`host/memory/refused.rs`, `learned.rs`; [cổng tự cải thiện](SELF_IMPROVEMENT_GATE.vi.md)).
 - **Guard.** Guard cho lệnh và che giá trị bí mật chạy trong tool dispatch ở mọi approval mode, là Rust đã biên dịch chứ không phải hook script ([guard](GUARDS.vi.md)).
 - **Đổi chiến lược và các lớp runtime.** Các turn của một goal là những lần đánh giá chiến lược của nó; tới plateau, một child strategist nêu tên các chiến lược khác. Theo dõi trajectory, luật học được, ghi chú tool và learned skill được recall định hình runtime quanh model ([chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)).
 - **Định danh project.** Project được định danh theo Git repository, nên thư mục con hay linked worktree mở project của main checkout; store giữ dưới key cũ được chuyển về đúng chỗ, và `ha project rekey` chuyển bằng tay ([định danh project](PROJECT_IDENTITY.vi.md)).
@@ -330,6 +331,7 @@ Các test đánh dấu `#[ignore]` (ca acceptance dùng pseudo-terminal) bị `c
 - [Memory store](MEMORY_STORE.vi.md)
 - [Định danh project](PROJECT_IDENTITY.vi.md)
 - [Tự đánh giá](SELF_EVALUATION.vi.md)
+- [Điều review được báo trước khi lên kế hoạch lần nữa](SELF_IMPROVEMENT_GATE.vi.md)
 - [Session continuity](SESSION_CONTINUITY.vi.md)
 - [Sleep](SLEEP.vi.md)
 - [Đổi chiến lược và runtime harness](STRATEGY_AND_RUNTIME.vi.md)

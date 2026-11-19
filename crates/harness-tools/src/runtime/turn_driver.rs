@@ -30,8 +30,8 @@ use serde_json::{Value, json};
 
 use crate::{
     ApprovalGrant, AskUserInput, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT,
-    HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest, ToolExecutionService, ToolExecutionView,
-    ToolOutput, ToolRequest,
+    GIT_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest,
+    ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest,
     capture::StreamTail,
     coding_tool_names, tool_pattern_for_action,
     truncate::{
@@ -625,6 +625,33 @@ fn is_document(path: &str) -> bool {
                 "md" | "markdown" | "txt" | "rst" | "adoc"
             )
         })
+}
+
+/// How much of a stalled step's reasoning the model is shown again.
+const EMPTY_STEP_REASONING_CHARS: usize = 600;
+
+/// What the model is told when a step had no text and called no tool. Its
+/// reasoning, when it had any, is shown from where it stopped (the last
+/// characters, cut at a character boundary), so the model sees what it was
+/// about to do.
+fn empty_step_nudge(reasoning: Option<&str>) -> String {
+    const BASE: &str = "Your last reply had no text and called no tool. Continue the task from where it stands: call the tool needed next, or give the answer.";
+    let Some(reasoning) = reasoning else {
+        return BASE.to_owned();
+    };
+    let skip = reasoning
+        .chars()
+        .count()
+        .saturating_sub(EMPTY_STEP_REASONING_CHARS);
+    let start = reasoning
+        .char_indices()
+        .nth(skip)
+        .map_or(reasoning.len(), |(index, _)| index);
+    let ellipsis = if skip > 0 { "..." } else { "" };
+    format!(
+        "{BASE}\nYour reasoning in that reply ended with: {ellipsis}{}",
+        &reasoning[start..]
+    )
 }
 
 /// What the model is told, without a judge, when a turn changed code and ran
@@ -2207,6 +2234,8 @@ impl TurnDriver {
         let mut stop_hook_active = false;
         // The completion check sends the model back once per turn.
         let mut completion_checked = false;
+        // An empty step is continued once per turn.
+        let mut empty_step_continued = false;
         // The files this turn changed and about how many lines, and whether
         // its end was already evaluated: once per turn, as the reminder.
         let mut changed_files: Vec<ChangedFile> = Vec::new();
@@ -2529,6 +2558,45 @@ impl TurnDriver {
                         );
                     }
                     transcript.extend(steering);
+                    result = self
+                        .runtime
+                        .continue_run(
+                            &request,
+                            &transcript,
+                            cancellation.clone(),
+                            Some(sink_with(&observer, prefetcher.clone())),
+                        )
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    continue 'turn;
+                }
+                // A step with no text and no call is a stall, not an answer:
+                // the turn used to end with an empty reply. Once per turn the
+                // model is told so and the turn goes on; a second empty step
+                // ends it as before.
+                if !empty_step_continued
+                    && result.response.trim().is_empty()
+                    && !cancellation.is_cancelled()
+                {
+                    empty_step_continued = true;
+                    steps += 1;
+                    observer.observe(TurnProgress::StepStarted { step: steps });
+                    let reasoning = result
+                        .reasoning
+                        .as_ref()
+                        .map(|reasoning| reasoning.text.trim())
+                        .filter(|text| !text.is_empty());
+                    harness_types::diag::info("turn", "empty_step_continued")
+                        .field("step", steps)
+                        .field("had_reasoning", reasoning.is_some())
+                        .emit();
+                    observer.observe(TurnProgress::Notice(
+                        "the last reply had no text and no tool call; asking the model to continue"
+                            .to_owned(),
+                    ));
+                    let nudge = empty_step_nudge(reasoning);
+                    self.record_host_message(&result.run_id, &nudge).await;
+                    transcript.push(ProviderMessage::new(MessageRole::User, nudge));
                     result = self
                         .runtime
                         .continue_run(
@@ -5049,6 +5117,9 @@ async fn run_post_tool_hooks(
         answer
             .host_context
             .extend(tools.result_context(&prepared.final_action, &view.output));
+        answer
+            .host_context
+            .extend(tools.location_notes(view.execution_id.as_ref()));
         return answer;
     }
     let mut payload = crate::service::tool_hook_payload(prepared, "post_tool_use");
@@ -5064,6 +5135,9 @@ async fn run_post_tool_hooks(
     answer
         .host_context
         .extend(tools.result_context(&prepared.final_action, &view.output));
+    answer
+        .host_context
+        .extend(tools.location_notes(view.execution_id.as_ref()));
     answer
 }
 
@@ -5101,6 +5175,10 @@ fn short_hash(hash: &str) -> String {
 }
 
 /// One-line, secret-free description of the exact action being approved.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive match names every tool's call"
+)]
 fn summarize_action(action: &CodingToolAction) -> String {
     match action {
         CodingToolAction::ReadFile {
@@ -5194,6 +5272,20 @@ fn summarize_action(action: &CodingToolAction) -> String {
             "git log {} (limit {})",
             path.as_deref().unwrap_or("."),
             limit.unwrap_or(GIT_LOG_DEFAULT_LIMIT)
+        ),
+        CodingToolAction::GitSearch { query, path, limit } => format!(
+            "git search {query:?} in {} (limit {})",
+            path.as_deref().unwrap_or("."),
+            limit.unwrap_or(GIT_SEARCH_DEFAULT_LIMIT)
+        ),
+        CodingToolAction::GitShow {
+            commit,
+            path,
+            offset,
+            ..
+        } => format!(
+            "git show {commit} {} @{offset}",
+            path.as_deref().unwrap_or(".")
         ),
         CodingToolAction::TaskUpdate { note } => format!("task update: {note}"),
         CodingToolAction::ExternalTool {
@@ -7536,5 +7628,640 @@ mod reread_driver_tests {
         assert_eq!(transcript[2].content, whole);
         assert_eq!(reread.tally.unchanged, 0);
         assert_eq!(reread.tally.saved_bytes, 0);
+    }
+}
+
+/// The real turn loop with a scripted model: an empty step, and the places a
+/// conversation's shell calls keep.
+#[cfg(test)]
+mod scripted_turn_tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use harness_providers::{
+        CancellationToken, MessageRole, ModelCapabilities, ModelProvider, ProviderFuture,
+        ProviderRequest, ProviderStreamEvent,
+    };
+    use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
+    use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+    use harness_types::{HostId, InputId, ProjectId, SessionId, TaskId};
+
+    use super::{
+        ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
+        TurnOutcome, TurnProgress, TurnStop,
+    };
+    use crate::{coding_tool_schemas, observe_workspace};
+
+    /// One scripted response per model call; every request is kept.
+    struct Scripted {
+        responses: Vec<Vec<ProviderStreamEvent>>,
+        calls: AtomicUsize,
+        seen: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl ModelProvider for Scripted {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::deepseek_fixture()
+        }
+
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> ProviderFuture {
+            self.seen.lock().expect("requests").push(request.clone());
+            let index = self
+                .calls
+                .fetch_add(1, Ordering::SeqCst)
+                .min(self.responses.len() - 1);
+            let mut events = self.responses[index].clone();
+            if let Some(ProviderStreamEvent::Started { request_id }) = events.first_mut() {
+                *request_id = request.request_id;
+            }
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    #[derive(Default)]
+    struct Notices(Mutex<Vec<String>>);
+
+    impl TurnObserver for Notices {
+        fn observe(&self, progress: TurnProgress) {
+            if let TurnProgress::Notice(text) = progress {
+                self.0.lock().expect("notices").push(text);
+            }
+        }
+    }
+
+    fn empty(reasoning: &str) -> Vec<ProviderStreamEvent> {
+        let mut events = vec![ProviderStreamEvent::started()];
+        if !reasoning.is_empty() {
+            events.push(ProviderStreamEvent::thinking(reasoning));
+        }
+        events.push(ProviderStreamEvent::completed("stop"));
+        events
+    }
+
+    fn answer(text: &str) -> Vec<ProviderStreamEvent> {
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text(text),
+            ProviderStreamEvent::completed("stop"),
+        ]
+    }
+
+    struct Run {
+        outcome: TurnOutcome,
+        seen: Vec<ProviderRequest>,
+        notices: Vec<String>,
+    }
+
+    async fn run(responses: Vec<Vec<ProviderStreamEvent>>, max_steps: u32) -> Run {
+        run_with(responses, max_steps, |_| {}, true).await
+    }
+
+    /// `setup` prepares the workspace; `kept` is the shell location switch.
+    async fn run_with(
+        responses: Vec<Vec<ProviderStreamEvent>>,
+        max_steps: u32,
+        setup: impl FnOnce(&Path),
+        kept: bool,
+    ) -> Run {
+        let temp = tempfile::tempdir().expect("temp root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        setup(&workspace);
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let provider = Arc::new(Scripted {
+            responses,
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig::default(),
+        ));
+        let driver = TurnDriver::new(
+            runtime,
+            ToolExecutionService::new(store).with_shell_location_kept(kept),
+        );
+        let request = RunRequest::new(
+            SessionId::generate(),
+            TaskId::generate(),
+            InputId::generate(),
+            "do the task".to_owned(),
+            observe_workspace(ProjectId::generate(), Path::new(&workspace)).expect("observation"),
+        )
+        .with_tool_schemas(coding_tool_schemas());
+        let notices = Arc::new(Notices::default());
+        let outcome = driver
+            .run_turn(
+                request,
+                TurnOptions {
+                    workspace_root: workspace,
+                    actor_id: "empty-step.test".to_owned(),
+                    approvals: ApprovalMode::Auto,
+                    limits: TurnLimits {
+                        max_steps,
+                        ..TurnLimits::default()
+                    },
+                },
+                notices.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn runs");
+        let seen = provider.seen.lock().expect("requests").clone();
+        let notices = notices.0.lock().expect("notices").clone();
+        Run {
+            outcome,
+            seen,
+            notices,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_step_is_continued_once_and_the_next_reply_is_the_answer() {
+        let run = run(
+            vec![
+                empty("I should look at the files next."),
+                answer("all done"),
+            ],
+            8,
+        )
+        .await;
+        assert_eq!(run.outcome.stop, TurnStop::Final);
+        assert_eq!(run.outcome.final_text, "all done");
+        assert_eq!(run.seen.len(), 2);
+        let sent = run.seen[1].messages.last().expect("a message");
+        assert_eq!(sent.role, MessageRole::User);
+        assert!(
+            sent.content.starts_with(
+                "Your last reply had no text and called no tool. Continue the task from where it stands"
+            ),
+            "{}",
+            sent.content
+        );
+        assert!(
+            sent.content
+                .contains("ended with: I should look at the files next."),
+            "{}",
+            sent.content
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|notice| notice.contains("no text and no tool call")),
+            "{:?}",
+            run.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_step_without_reasoning_is_continued_without_it() {
+        let run = run(vec![empty(""), answer("done")], 8).await;
+        assert_eq!(run.outcome.final_text, "done");
+        let sent = run.seen[1].messages.last().expect("a message");
+        assert!(!sent.content.contains("reasoning"), "{}", sent.content);
+    }
+
+    #[tokio::test]
+    async fn a_second_empty_step_ends_the_turn() {
+        let run = run(vec![empty("a"), empty("b"), answer("never reached")], 8).await;
+        assert_eq!(run.outcome.stop, TurnStop::Final);
+        assert!(run.outcome.final_text.is_empty());
+        assert_eq!(run.seen.len(), 2, "continued once, not twice");
+    }
+
+    #[tokio::test]
+    async fn a_step_with_text_is_not_continued() {
+        let run = run(vec![answer("here it is"), answer("never reached")], 8).await;
+        assert_eq!(run.outcome.final_text, "here it is");
+        assert_eq!(run.seen.len(), 1);
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+    }
+
+    #[tokio::test]
+    async fn an_empty_step_at_the_step_limit_is_not_continued() {
+        let run = run(vec![empty("x"), answer("never reached")], 1).await;
+        assert_eq!(run.outcome.stop, TurnStop::Final);
+        assert_eq!(run.seen.len(), 1);
+    }
+
+    #[test]
+    fn the_reasoning_shown_again_is_its_last_characters_cut_at_a_boundary() {
+        let long = format!("{}{}", "é".repeat(700), "end");
+        let nudge = super::empty_step_nudge(Some(&long));
+        let shown = nudge
+            .split("ended with: ")
+            .nth(1)
+            .expect("reasoning is shown");
+        assert!(shown.starts_with("..."), "{shown}");
+        assert_eq!(
+            shown.trim_start_matches("...").chars().count(),
+            super::EMPTY_STEP_REASONING_CHARS
+        );
+        assert!(shown.ends_with("end"));
+        assert!(!super::empty_step_nudge(Some("short")).contains("..."));
+    }
+
+    // The places a conversation's shell calls keep, through the real tool gate.
+
+    fn call(id: &str, name: &str, arguments: &serde_json::Value) -> Vec<ProviderStreamEvent> {
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(id, name, arguments.to_string()),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]
+    }
+
+    fn shell(id: &str, command: &str) -> Vec<ProviderStreamEvent> {
+        call(
+            id,
+            "run_shell",
+            &serde_json::json!({"command": command, "timeout_ms": 60_000}),
+        )
+    }
+
+    /// Go into `sub`, in the shell `run_shell` starts here.
+    const ENTER: &str = if cfg!(windows) {
+        "Set-Location sub"
+    } else {
+        "cd sub"
+    };
+    /// Print where the shell is.
+    const WHERE: &str = if cfg!(windows) {
+        "(Get-Location).Path"
+    } else {
+        "pwd"
+    };
+
+    fn stdout_of(view: &crate::ToolExecutionView) -> String {
+        match &view.output {
+            crate::ToolOutput::Process { stdout, .. } => stdout.trim().to_owned(),
+            other => panic!("not a process result: {other:?}"),
+        }
+    }
+
+    fn exit_of(view: &crate::ToolExecutionView) -> Option<i32> {
+        match &view.output {
+            crate::ToolOutput::Process { exit_code, .. } => *exit_code,
+            other => panic!("not a process result: {other:?}"),
+        }
+    }
+
+    /// The text the model was sent for the result of call `id`, last time.
+    fn result_text(run: &Run, id: &str) -> String {
+        run.seen
+            .last()
+            .expect("a model call")
+            .messages
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some(id))
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn with_sub(workspace: &Path) {
+        std::fs::create_dir_all(workspace.join("sub")).expect("sub");
+        std::fs::write(workspace.join("sub").join("marker.txt"), "found-it").expect("marker");
+    }
+
+    fn git_in(workspace: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("git starts");
+        assert!(output.status.success(), "git {args:?}");
+    }
+
+    /// A repository with `sub/old/a.txt` committed and `sub/old/b.txt` not.
+    fn with_untracked_work(workspace: &Path) {
+        std::fs::create_dir_all(workspace.join("sub/old")).expect("dirs");
+        std::fs::write(workspace.join("sub/old/a.txt"), "a").expect("tracked");
+        git_in(workspace, &["init", "-q"]);
+        git_in(workspace, &["add", "-A"]);
+        git_in(workspace, &["commit", "-qm", "base"]);
+        std::fs::write(workspace.join("sub/old/b.txt"), "b").expect("untracked");
+    }
+
+    #[tokio::test]
+    async fn a_directory_left_by_one_shell_call_is_where_the_next_one_starts() {
+        let read = if cfg!(windows) {
+            "Get-Content marker.txt"
+        } else {
+            "cat marker.txt"
+        };
+        let run = run_with(
+            vec![
+                shell("a", ENTER),
+                shell("b", WHERE),
+                shell("c", read),
+                answer("done"),
+            ],
+            8,
+            with_sub,
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(views.len(), 3);
+        assert_eq!(exit_of(&views[0]), Some(0));
+        let here = stdout_of(&views[1]).replace('\\', "/");
+        assert!(here.ends_with("/workspace/sub"), "{here}");
+        assert_eq!(stdout_of(&views[2]), "found-it");
+        let first = result_text(&run, "a");
+        assert!(
+            first.contains("the next call starts in sub"),
+            "the move is told: {first}"
+        );
+        assert!(
+            !first.contains("ran in"),
+            "the first call ran at the root: {first}"
+        );
+        assert!(
+            result_text(&run, "b").contains("ran in sub"),
+            "{}",
+            result_text(&run, "b")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_process_starts_where_the_shell_left_off() {
+        let run = run_with(
+            vec![
+                shell("a", ENTER),
+                call(
+                    "b",
+                    "run_process",
+                    &serde_json::json!({
+                        "executable": "git",
+                        "args": ["rev-parse", "--show-prefix"],
+                        "timeout_ms": 60_000
+                    }),
+                ),
+                answer("done"),
+            ],
+            8,
+            with_untracked_work,
+            true,
+        )
+        .await;
+        assert_eq!(stdout_of(&run.outcome.executions[1]), "sub/");
+        assert!(result_text(&run, "b").contains("ran in sub"));
+    }
+
+    #[tokio::test]
+    async fn a_directory_outside_the_workspace_is_not_kept() {
+        let outside = std::env::temp_dir();
+        let go = if cfg!(windows) {
+            format!("Set-Location '{}'", outside.display())
+        } else {
+            format!("cd '{}'", outside.display())
+        };
+        let run = run_with(
+            vec![shell("a", &go), shell("b", WHERE), answer("done")],
+            8,
+            |_| {},
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(exit_of(&views[0]), Some(0));
+        let here = stdout_of(&views[1]).replace('\\', "/");
+        assert!(here.ends_with("/workspace"), "{here}");
+        let told = result_text(&run, "a");
+        assert!(
+            told.contains("outside the workspace") && told.contains("starts at the workspace root"),
+            "{told}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_path_is_kept_and_no_other_variable_is() {
+        let change = if cfg!(windows) {
+            "$env:PATH = 'C:\\zz-extra-dir;' + $env:PATH; $env:HA_KEEP_TEST = 'secret'"
+        } else {
+            "PATH=/zz-extra-dir:$PATH; HA_KEEP_TEST=secret; export PATH HA_KEEP_TEST"
+        };
+        let show = if cfg!(windows) {
+            "Write-Output \"path=$env:PATH\"; Write-Output \"var=[$env:HA_KEEP_TEST]\""
+        } else {
+            "echo \"path=$PATH\"; echo \"var=[$HA_KEEP_TEST]\""
+        };
+        let run = run_with(
+            vec![shell("a", change), shell("b", show), answer("done")],
+            8,
+            |_| {},
+            true,
+        )
+        .await;
+        let shown = stdout_of(&run.outcome.executions[1]);
+        assert!(shown.contains("zz-extra-dir"), "{shown}");
+        assert!(shown.contains("var=[]"), "{shown}");
+        assert!(
+            result_text(&run, "a").contains("PATH was changed"),
+            "{}",
+            result_text(&run, "a")
+        );
+    }
+
+    /// A call that leaves `PATH` without the directory of the shell (here: one
+    /// unrelated directory) must not leave the next call without a shell: the
+    /// shell is started by the path found in the host's own `PATH`, and the
+    /// kept one is only what the command runs with. A program the command
+    /// starts by name is looked up in the kept one, as in a real shell.
+    #[tokio::test]
+    async fn a_kept_path_that_drops_the_shell_does_not_stop_the_next_call() {
+        let empty = if cfg!(windows) {
+            "$env:PATH = 'C:\\zz-nowhere-dir'"
+        } else {
+            "PATH=/zz-nowhere-dir; export PATH"
+        };
+        let show = if cfg!(windows) {
+            "Write-Output \"path=$env:PATH\""
+        } else {
+            "echo \"path=$PATH\""
+        };
+        let run = run_with(
+            vec![
+                shell("a", empty),
+                shell("b", show),
+                call(
+                    "c",
+                    "run_process",
+                    &serde_json::json!({
+                        "executable": "git",
+                        "args": ["--version"],
+                        "timeout_ms": 60_000
+                    }),
+                ),
+                shell("d", "git --version"),
+                answer("done"),
+            ],
+            8,
+            |_| {},
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(exit_of(&views[0]), Some(0));
+        // The shell started, and reports the kept PATH.
+        assert_eq!(exit_of(&views[1]), Some(0), "the next shell call started");
+        assert!(
+            stdout_of(&views[1]).contains("path=") && stdout_of(&views[1]).contains("zz-nowhere"),
+            "{}",
+            stdout_of(&views[1])
+        );
+        // A program that is on the host's PATH only is not found by the kept one:
+        // a run_process says it did not start, and the shell says it has no such
+        // command, as a real shell with that PATH would.
+        match &views[2].output {
+            crate::ToolOutput::Denied { reason, .. } => {
+                assert!(reason.contains("did not start"), "{reason}");
+            }
+            other => panic!("git was found on the kept PATH: {other:?}"),
+        }
+        assert_ne!(exit_of(&views[3]), Some(0), "{}", stdout_of(&views[3]));
+    }
+    #[tokio::test]
+    async fn a_command_that_exits_itself_keeps_its_status_and_still_moves_the_place() {
+        let leave = if cfg!(windows) {
+            "Set-Location ..; exit 3"
+        } else {
+            "cd ..; exit 3"
+        };
+        let run = run_with(
+            vec![
+                shell("a", ENTER),
+                shell("b", leave),
+                shell("c", WHERE),
+                answer("done"),
+            ],
+            8,
+            with_sub,
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(exit_of(&views[1]), Some(3));
+        let here = stdout_of(&views[2]).replace('\\', "/");
+        assert!(here.ends_with("/workspace"), "{here}");
+    }
+
+    /// A command that goes into `sub` and then exits itself: the place is `sub`.
+    #[tokio::test]
+    async fn an_exit_in_the_first_call_still_moves_the_place() {
+        let enter_and_exit = if cfg!(windows) {
+            "Set-Location sub; exit 3"
+        } else {
+            "cd sub; exit 3"
+        };
+        let run = run_with(
+            vec![
+                shell("a", enter_and_exit),
+                shell("b", WHERE),
+                answer("done"),
+            ],
+            8,
+            with_sub,
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(exit_of(&views[0]), Some(3));
+        let here = stdout_of(&views[1]).replace('\\', "/");
+        assert!(here.ends_with("/workspace/sub"), "{here}");
+    }
+
+    /// A native program that fails: its own exit code is the call's, where
+    /// PowerShell's `-Command` would say 1.
+    #[tokio::test]
+    async fn a_native_programs_exit_code_is_the_calls() {
+        let fail = if cfg!(windows) {
+            "cmd /c exit 5"
+        } else {
+            "sh -c 'exit 5'"
+        };
+        let run = run_with(vec![shell("a", fail), answer("done")], 8, |_| {}, true).await;
+        assert_eq!(exit_of(&run.outcome.executions[0]), Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_failing_command_keeps_its_status_and_still_moves_the_place() {
+        let fail = if cfg!(windows) {
+            "Set-Location sub; Get-Item zz-missing-zz"
+        } else {
+            "cd sub; false"
+        };
+        let run = run_with(
+            vec![shell("a", fail), shell("b", WHERE), answer("done")],
+            8,
+            with_sub,
+            true,
+        )
+        .await;
+        let views = &run.outcome.executions;
+        assert_eq!(exit_of(&views[0]), Some(1));
+        let here = stdout_of(&views[1]).replace('\\', "/");
+        assert!(here.ends_with("/workspace/sub"), "{here}");
+    }
+
+    /// The guard read `old` from the workspace root, where it is no folder at
+    /// all, so a recursive delete of untracked work named from the folder the
+    /// shell was in passed.
+    #[tokio::test]
+    async fn the_guards_read_a_relative_path_from_the_kept_directory() {
+        let delete = if cfg!(windows) {
+            "Remove-Item -Recurse -Force old"
+        } else {
+            "rm -rf old"
+        };
+        let run = run_with(
+            vec![shell("a", ENTER), shell("b", delete), answer("done")],
+            8,
+            with_untracked_work,
+            true,
+        )
+        .await;
+        match &run.outcome.executions[1].output {
+            crate::ToolOutput::Denied { reason, .. } => {
+                assert!(
+                    reason.contains("recursive-delete") && reason.contains("b.txt"),
+                    "{reason}"
+                );
+            }
+            other => panic!("the delete was not refused: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_every_call_starts_at_the_root() {
+        let run = run_with(
+            vec![shell("a", ENTER), shell("b", WHERE), answer("done")],
+            8,
+            with_sub,
+            false,
+        )
+        .await;
+        let here = stdout_of(&run.outcome.executions[1]).replace('\\', "/");
+        assert!(here.ends_with("/workspace"), "{here}");
+        assert!(
+            !result_text(&run, "a").contains("next call starts"),
+            "{}",
+            result_text(&run, "a")
+        );
     }
 }

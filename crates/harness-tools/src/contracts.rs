@@ -96,6 +96,10 @@ const fn default_history_page_length() -> u32 {
     HISTORY_READ_DEFAULT_BYTES
 }
 
+const fn default_git_show_length() -> u32 {
+    GIT_SHOW_DEFAULT_BYTES
+}
+
 fn is_environment_name(name: &str) -> bool {
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
@@ -162,6 +166,14 @@ pub const SEARCH_ANY_OF_MAX: u32 = 16;
 /// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
 /// history. The provider schema and the typed action both carry this bound.
 pub const GIT_LOG_MAX_LIMIT: u32 = 100;
+/// Commits `git_search` returns when the model names no limit.
+pub const GIT_SEARCH_DEFAULT_LIMIT: u32 = 10;
+/// Most commits one `git_search` returns.
+pub const GIT_SEARCH_MAX_LIMIT: u32 = 20;
+/// Largest diff page one `git_show` returns.
+pub const GIT_SHOW_MAX_BYTES: u32 = 64 * 1024;
+/// Diff page size used when a `git_show` names no length.
+pub const GIT_SHOW_DEFAULT_BYTES: u32 = 16 * 1024;
 
 /// A stable capability name used by policy, approvals, receipts, and UI views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -186,6 +198,10 @@ pub enum ToolKind {
     GitStatus,
     GitDiff,
     GitLog,
+    /// Find past commits by what their messages and files were about.
+    GitSearch,
+    /// Read one commit: its message, files and diff.
+    GitShow,
     TaskUpdate,
     /// An external extension tool, reachable only through the same policy gate.
     ExternalTool,
@@ -211,6 +227,8 @@ impl ToolKind {
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
             Self::GitLog => "git_log",
+            Self::GitSearch => "git_search",
+            Self::GitShow => "git_show",
             Self::TaskUpdate => "task_update",
             Self::ExternalTool => "external_tool",
         }
@@ -244,6 +262,8 @@ impl ToolKind {
                 | Self::GitStatus
                 | Self::GitDiff
                 | Self::GitLog
+                | Self::GitSearch
+                | Self::GitShow
         )
     }
 }
@@ -271,6 +291,8 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "git_status",
         "git_diff",
         "git_log",
+        "git_search",
+        "git_show",
         "task_update",
         "ask_user",
     ]
@@ -298,7 +320,7 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         "write_file" => &["path", "content", "expected_hash"],
         "edit_file" => &["path", "old_string", "new_string", "replace_all", "edits"],
         "glob" => &["pattern", "path"],
-        "find_files" => &["query", "path", "limit"],
+        "find_files" | "git_search" => &["query", "path", "limit"],
         "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
         "git_status" => &[],
@@ -308,6 +330,7 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         ],
         "history_read" => &["source_id", "offset", "length", "scope"],
         "git_log" => &["path", "limit"],
+        "git_show" => &["commit", "path", "offset", "length"],
         "task_update" => &["note"],
         _ => return None,
     })
@@ -503,11 +526,24 @@ fn process_timeout(
     }
 }
 
+/// What `run_process` and `run_shell` tell the model about where they start,
+/// while `HA_SHELL_KEEP_LOCATION` leaves it kept.
+fn process_location_note() -> &'static str {
+    if crate::location::enabled() {
+        " It starts in the directory, and with the PATH, that a previous run_shell of this conversation left, as long as that is inside the workspace; otherwise at the workspace root. A cd in one run_shell therefore holds for the next call."
+    } else {
+        ""
+    }
+}
+
 fn process_tool_schemas() -> Vec<Value> {
     vec![
         function_schema(
             "run_process",
-            "Run an explicitly structured executable and argv in the workspace.",
+            &format!(
+                "Run an explicitly structured executable and argv in the workspace.{}",
+                process_location_note()
+            ),
             json!({
                 "executable": string_schema(),
                 "args": {"type": "array", "items": string_schema()},
@@ -519,7 +555,10 @@ fn process_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "run_shell",
-            "Run an explicitly requested shell command; never use this for structured argv.",
+            &format!(
+                "Run an explicitly requested shell command; never use this for structured argv.{}",
+                process_location_note()
+            ),
             json!({
                 "command": string_schema(),
                 "timeout_ms": timeout_schema(),
@@ -558,12 +597,33 @@ fn git_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "git_log",
-            "Inspect recent Git history as bounded tab-separated fields without changing the workspace.",
+            "Inspect recent Git history as bounded tab-separated fields without changing the workspace. To find a commit by what it was about, use git_search.",
             json!({
                 "path": nullable_string_schema(),
                 "limit": {"type": "integer", "minimum": 1, "maximum": GIT_LOG_MAX_LIMIT}
             }),
             &[],
+        ),
+        function_schema(
+            "git_search",
+            "Find past commits by what they were about: ranks the messages and changed file names of the repository's recent commits against a query (identifiers like parse_header count as words) and returns the best ones with their changed files. Read a hit with git_show. Read-only.",
+            json!({
+                "query": string_schema(),
+                "path": nullable_string_schema(),
+                "limit": {"type": "integer", "minimum": 1, "maximum": GIT_SEARCH_MAX_LIMIT}
+            }),
+            &["query"],
+        ),
+        function_schema(
+            "git_show",
+            "Read one commit: its message, the files it changed with added and removed line counts, and its diff. A long diff is paged: pass the offset the result names to read on. Read-only.",
+            json!({
+                "commit": string_schema(),
+                "path": nullable_string_schema(),
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": GIT_SHOW_MAX_BYTES}
+            }),
+            &["commit"],
         ),
         function_schema(
             "task_update",
@@ -841,6 +901,22 @@ pub enum CodingToolAction {
         path: Option<String>,
         limit: Option<u32>,
     },
+    /// Find past commits by what they were about (BM25 over their messages
+    /// and changed file names).
+    GitSearch {
+        query: String,
+        path: Option<String>,
+        limit: Option<u32>,
+    },
+    /// Read one commit: message, files, and a page of its diff.
+    GitShow {
+        commit: String,
+        path: Option<String>,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_git_show_length")]
+        length: u32,
+    },
     TaskUpdate {
         note: String,
     },
@@ -877,6 +953,8 @@ impl CodingToolAction {
             Self::GitStatus => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::GitLog { .. } => ToolKind::GitLog,
+            Self::GitSearch { .. } => ToolKind::GitSearch,
+            Self::GitShow { .. } => ToolKind::GitShow,
             Self::TaskUpdate { .. } => ToolKind::TaskUpdate,
             Self::ExternalTool { .. } => ToolKind::ExternalTool,
         }
@@ -894,7 +972,9 @@ impl CodingToolAction {
             | Self::Glob { path, .. }
             | Self::FindFiles { path, .. }
             | Self::GitDiff { path }
-            | Self::GitLog { path, .. } => path.as_deref(),
+            | Self::GitLog { path, .. }
+            | Self::GitSearch { path, .. }
+            | Self::GitShow { path, .. } => path.as_deref(),
             Self::RunProcess { .. }
             | Self::RunShell { .. }
             | Self::ReadProcessOutput { .. }
@@ -953,7 +1033,14 @@ impl CodingToolAction {
         }
         if matches!(
             name,
-            "list_files" | "search_text" | "glob" | "find_files" | "git_diff" | "git_log"
+            "list_files"
+                | "search_text"
+                | "glob"
+                | "find_files"
+                | "git_diff"
+                | "git_log"
+                | "git_search"
+                | "git_show"
         ) && object
             .get("path")
             .is_some_and(|value| !value.is_null() && !value.is_string())
@@ -1258,6 +1345,71 @@ impl CodingToolAction {
                 Ok(Self::GitLog {
                     path: optional_path(object),
                     limit,
+                })
+            }
+            "git_search" => {
+                let query = required_string(object, "query")?;
+                if query.trim().is_empty() {
+                    return Err(harness_types::HarnessError::new(
+                        harness_types::ErrorCode::InvalidPayload,
+                        "provider git_search query must not be blank",
+                    ));
+                }
+                let limit = match object.get("limit") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .and_then(|limit| u32::try_from(limit).ok())
+                            .filter(|limit| (1..=GIT_SEARCH_MAX_LIMIT).contains(limit))
+                            .ok_or_else(|| {
+                                harness_types::HarnessError::new(
+                                    harness_types::ErrorCode::InvalidPayload,
+                                    format!(
+                                        "provider git_search limit must be an integer between 1 and {GIT_SEARCH_MAX_LIMIT}"
+                                    ),
+                                )
+                            })?,
+                    ),
+                };
+                Ok(Self::GitSearch {
+                    query,
+                    path: optional_path(object),
+                    limit,
+                })
+            }
+            "git_show" => {
+                let commit = required_string(object, "commit")?;
+                crate::git_history::check_revision(&commit)?;
+                let offset = match object.get("offset") {
+                    None | Some(Value::Null) => 0,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        harness_types::HarnessError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "provider git_show offset must be a non-negative integer",
+                        )
+                    })?,
+                };
+                let length = match object.get("length") {
+                    None | Some(Value::Null) => GIT_SHOW_DEFAULT_BYTES,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|length| u32::try_from(length).ok())
+                        .filter(|length| (1..=GIT_SHOW_MAX_BYTES).contains(length))
+                        .ok_or_else(|| {
+                            harness_types::HarnessError::new(
+                                harness_types::ErrorCode::InvalidPayload,
+                                format!(
+                                    "provider git_show length must be an integer between 1 and {GIT_SHOW_MAX_BYTES}"
+                                ),
+                            )
+                        })?,
+                };
+                Ok(Self::GitShow {
+                    commit,
+                    path: optional_path(object),
+                    offset,
+                    length,
                 })
             }
             "task_update" => Ok(Self::TaskUpdate {
@@ -1825,6 +1977,8 @@ pub fn effect_class_for(name: &str) -> EffectClass {
         | "git_status"
         | "git_diff"
         | "git_log"
+        | "git_search"
+        | "git_show"
         | "read_process_output"
         | "history_search"
         | "history_read"
@@ -2469,7 +2623,10 @@ mod edit_file_parser_tests {
 mod schema_parser_agreement_tests {
     use std::collections::BTreeSet;
 
-    use super::{allowed_fields, coding_tool_schemas};
+    use super::{
+        CodingToolAction, EffectClass, GIT_SHOW_DEFAULT_BYTES, ToolKind, allowed_fields,
+        coding_tool_names, coding_tool_schemas, effect_class_for,
+    };
 
     /// Every call is checked against the schema the model is shown before the
     /// parser reads it (pa-agent's `validateToolArguments`), so the two must
@@ -2500,7 +2657,105 @@ mod schema_parser_agreement_tests {
             }
         }
     }
+
+    /// The two history tools were only checked here if they had an entry in
+    /// `allowed_fields`; a schema with no entry is skipped above. Each name is
+    /// listed, in the schemas, read-only and parsed.
+    #[test]
+    fn the_git_history_tools_are_listed_read_only_and_parsed() {
+        for name in ["git_search", "git_show"] {
+            assert!(coding_tool_names().contains(&name), "{name}");
+            assert!(allowed_fields(name).is_some(), "{name}");
+            assert!(
+                coding_tool_schemas()
+                    .iter()
+                    .any(|schema| schema["function"]["name"] == name),
+                "{name} has a schema"
+            );
+            assert_eq!(effect_class_for(name), EffectClass::ReadOnly, "{name}");
+        }
+        assert!(ToolKind::GitSearch.is_read_only());
+        assert!(ToolKind::GitShow.is_read_only());
+        assert_eq!(ToolKind::GitSearch.as_str(), "git_search");
+        assert_eq!(ToolKind::GitShow.as_str(), "git_show");
+
+        let search = CodingToolAction::from_provider_call(
+            "git_search",
+            r#"{"query":"parse_header","path":"src","limit":5}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            search,
+            CodingToolAction::GitSearch {
+                query: "parse_header".to_owned(),
+                path: Some("src".to_owned()),
+                limit: Some(5)
+            }
+        );
+        assert_eq!(search.kind(), ToolKind::GitSearch);
+        assert_eq!(search.path_hint(), Some("src"));
+        assert!(matches!(
+            CodingToolAction::from_provider_call("git_search", r#"{"query":"x"}"#),
+            Ok(CodingToolAction::GitSearch {
+                path: None,
+                limit: None,
+                ..
+            })
+        ));
+        for bad in [
+            "{}",
+            r#"{"query":""}"#,
+            r#"{"query":"  "}"#,
+            r#"{"query":"x","limit":0}"#,
+            r#"{"query":"x","limit":21}"#,
+            r#"{"query":"x","limit":"3"}"#,
+            r#"{"query":"x","path":3}"#,
+            r#"{"query":"x","extra":1}"#,
+        ] {
+            assert!(
+                CodingToolAction::from_provider_call("git_search", bad).is_err(),
+                "{bad}"
+            );
+        }
+
+        let show = CodingToolAction::from_provider_call("git_show", r#"{"commit":"abc1234"}"#)
+            .expect("parses");
+        assert_eq!(
+            show,
+            CodingToolAction::GitShow {
+                commit: "abc1234".to_owned(),
+                path: None,
+                offset: 0,
+                length: GIT_SHOW_DEFAULT_BYTES,
+            }
+        );
+        assert_eq!(show.kind(), ToolKind::GitShow);
+        assert!(
+            CodingToolAction::from_provider_call(
+                "git_show",
+                r#"{"commit":"HEAD~2","path":"src","offset":100,"length":65536}"#
+            )
+            .is_ok()
+        );
+        for bad in [
+            "{}",
+            r#"{"commit":"--output=x"}"#,
+            r#"{"commit":"-p"}"#,
+            r#"{"commit":"a b"}"#,
+            r#"{"commit":""}"#,
+            r#"{"commit":"a","offset":-1}"#,
+            r#"{"commit":"a","length":0}"#,
+            r#"{"commit":"a","length":65537}"#,
+            r#"{"commit":"a","limit":3}"#,
+        ] {
+            assert!(
+                CodingToolAction::from_provider_call("git_show", bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
 }
+
 /// A call that names no `timeout_ms` runs with the default. It was
 /// required, and a model that left it out (18 `run_shell` calls of 18 in
 /// one benchmark run) was refused before anything ran.

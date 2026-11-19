@@ -149,9 +149,25 @@ pub fn bm25_idf(documents: u64, matching: u64) -> f64 {
     (1.0 + (documents - matching + 0.5) / (matching + 0.5)).ln()
 }
 
+/// BM25's term-frequency saturation.
+pub const BM25_K1: f64 = 1.2;
+
+/// BM25's length normalization.
+pub const BM25_B: f64 = 0.75;
+
+/// What one term adds to a document's BM25 score: its `idf` ([`bm25_idf`]),
+/// times its `frequency` in the document, saturated by [`BM25_K1`] and
+/// normalized by how long the document is against the `average` one. Before
+/// this each search that scored text carried its own copy of the line.
+#[must_use]
+pub fn bm25_term(idf: f64, frequency: f64, length: f64, average: f64) -> f64 {
+    idf * frequency * (BM25_K1 + 1.0)
+        / (frequency + BM25_K1 * (1.0 - BM25_B + BM25_B * length / average.max(1.0)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Coverage, bm25_idf, match_words};
+    use super::{Coverage, bm25_idf, bm25_term, match_words};
 
     fn words(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
@@ -206,5 +222,20 @@ mod tests {
     fn a_rare_term_weighs_more() {
         assert!(bm25_idf(1000, 2) > bm25_idf(1000, 300));
         assert!(bm25_idf(10, 10) > 0.0);
+    }
+
+    #[test]
+    fn a_term_saturates_and_a_long_document_scores_less() {
+        let idf = bm25_idf(100, 5);
+        // A second occurrence adds less than the first.
+        let one = bm25_term(idf, 1.0, 10.0, 10.0);
+        let two = bm25_term(idf, 2.0, 10.0, 10.0);
+        let three = bm25_term(idf, 3.0, 10.0, 10.0);
+        assert!(two > one && three > two);
+        assert!(two - one > three - two);
+        // The same count in a longer document counts for less.
+        assert!(bm25_term(idf, 1.0, 40.0, 10.0) < one);
+        // An average of zero does not divide by it.
+        assert!(bm25_term(idf, 1.0, 0.0, 0.0).is_finite());
     }
 }
