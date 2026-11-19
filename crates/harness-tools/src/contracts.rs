@@ -398,7 +398,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
             "List bounded non-sensitive files rooted in the registered workspace. With preview, also see what the files hold in one call: each file's size and line count, and for a code file its outline (the lines that declare functions, types, classes, with line numbers), for Markdown its headings, else its first lines; the files directly in path come first.",
             json!({
                 "path": nullable_string_schema(),
-                "preview": {"type": "integer", "minimum": 1, "description": format!("Lines to show of each file (outline or first lines), at most {LIST_PREVIEW_MAX_LINES}; more is read as {LIST_PREVIEW_MAX_LINES}; at most {LIST_PREVIEW_MAX_FILES} files are previewed.")}
+                "preview": {"type": "integer", "minimum": 0, "description": format!("Lines to show of each file (outline or first lines), at most {LIST_PREVIEW_MAX_LINES}; more is read as {LIST_PREVIEW_MAX_LINES}; 0 shows none; at most {LIST_PREVIEW_MAX_FILES} files are previewed.")}
             }),
             &[],
         ),
@@ -2255,7 +2255,14 @@ mod search_context_tests {
             .find(|schema| schema["function"]["name"] == "list_files")
             .map(|schema| schema["function"]["parameters"].clone())
             .expect("schema");
-        for arguments in [r#"{"preview":5}"#, r#"{"path":"src","preview":99}"#] {
+        // `preview: 0` is read as none, so the schema takes it too: bug report
+        // 20261119-115208 saw it refused, "Expected value to be greater than
+        // or equal to 1", before the parser that reads it ever ran.
+        for arguments in [
+            r#"{"preview":5}"#,
+            r#"{"path":"src","preview":99}"#,
+            r#"{"path":null,"preview":0}"#,
+        ] {
             assert!(
                 crate::validation::validate_tool_arguments_json(
                     "list_files",

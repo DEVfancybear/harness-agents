@@ -63,6 +63,9 @@ echo "== a compaction"
 (cd "$P" && HA_COMPACT_AT=12000 "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Read gen/m1.txt, gen/m2.txt, gen/m3.txt and gen/m4.txt one at a time with read_file, whole. Then answer with the number of the last row of m4 only." >"$RX/compact.out" 2>"$RX/compact.err")
 check "the compacting run answers" 'grep -q 299 "$RX/compact.out"'
 check "a compaction was recorded with its numbers" '[ "$(records exec "r[\"kind\"]==\"compaction\" and (\"before\" in f or \"shortened\" in f or \"covered\" in f or \"after\" in f)")" -ge 1 ]'
+# Bug report 20261119-115208: 52 failed calls of a parent and seven children
+# were recorded with no conversation to tell them apart.
+check "every settled call names its conversation" '[ "$(records exec "r[\"kind\"]==\"call\" and r[\"event\"]==\"settled\"")" -ge 1 ] && [ "$(records exec "r[\"kind\"]==\"call\" and r[\"event\"]==\"settled\" and not r.get(\"task\",\"\").startswith(\"task_\")")" -eq 0 ]'
 
 echo "== a provider that refuses"
 (cd "$P" && "$HA" exec --model "opencode-go/no-such-model-0601" --approval full-auto "hi" >"$RX/refused.out" 2>"$RX/refused.err")
@@ -209,5 +212,28 @@ check "nothing from private/ is in it" '! find "$RX/report" -path "*private*" | 
 "$HA" diag timeline --since 1h --level warn > "$RX/timeline.txt" 2>&1
 check "ha diag timeline prints the warnings" 'grep -q "worker.died\|open_failed" "$RX/timeline.txt"'
 
+echo "== a worker that stops records how it ended (bug report 20261119-115208)"
+# A worker that logged "worker stopped" had no exit record, and the report took
+# it for one "still running, or killed or crashed".
 (cd "$P" && "$HA" shutdown --force >/dev/null 2>&1)
+stopped_unended() { "$PY" - "$D" <<'EOF'
+import glob, json, os, sys
+stopped, ended = set(), set()
+for path in glob.glob(os.path.join(sys.argv[1], "*-worker-*.jsonl")):
+    for line in open(path, encoding="utf-8"):
+        r = json.loads(line)
+        if r["kind"] == "worker" and r.get("msg") == "worker stopped":
+            stopped.add(r["pid"])
+        if r["kind"] == "process" and r["event"] in ("exit", "failed"):
+            ended.add(r["pid"])
+print(f"{len(stopped)} {len(stopped - ended)}")
+EOF
+}
+for _ in $(seq 1 60); do
+  read -r n_stopped n_unended <<< "$(stopped_unended | tr -d '\r')"
+  [ "${n_stopped:-0}" -ge 1 ] && [ "${n_unended:-1}" -eq 0 ] && break
+  sleep 0.5
+done
+echo "   workers stopped: ${n_stopped:-0}, of them with no exit record: ${n_unended:-?}"
+check "a worker that stopped recorded its exit" '[ "${n_stopped:-0}" -ge 1 ] && [ "${n_unended:-1}" -eq 0 ]'
 result

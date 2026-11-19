@@ -28,6 +28,8 @@ pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::M
 
 #[path = "protocols/anthropic.rs"]
 pub mod anthropic;
+#[path = "support/image_tokens.rs"]
+pub mod image_tokens;
 #[path = "support/json_repair.rs"]
 pub mod json_repair;
 #[path = "support/limits.rs"]
@@ -337,6 +339,25 @@ impl ImageAttachment {
     #[must_use]
     pub fn url(&self) -> String {
         self.source.url()
+    }
+
+    /// The tokens the image costs a request: by its pixels, not by the bytes
+    /// that carry it ([`image_tokens`]).
+    #[must_use]
+    pub fn estimated_tokens(&self) -> u64 {
+        match &self.source {
+            ImageSource::Inline { data_base64, .. } => image_tokens::estimate(data_base64),
+            ImageSource::Remote { .. } => image_tokens::UNREAD_IMAGE_TOKENS,
+        }
+    }
+
+    /// The bytes the image stands for in a byte-counted budget, which reads
+    /// four bytes as a token: its label and its tokens.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        usize::try_from(self.estimated_tokens().saturating_mul(4))
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.label.len())
     }
 }
 

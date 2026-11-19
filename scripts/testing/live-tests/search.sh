@@ -26,7 +26,9 @@
 #      cites it as path:line (the system prompt's three phases and citations).
 # And from the bug report:
 #  13. search_text on a path that is not there says it is missing and where a
-#      file of that name is, where it said "path must be a directory".
+#      file of that name is, where it said "path must be a directory";
+#  14. (bug report 20261119-115208) list_files with a file's path and preview
+#      0 lists that file, where the schema refused 0 and the tool the file.
 # Every check prints PASS or FAIL; the conversation stays in $LIVE_ROOT/search
 # as evidence.
 #
@@ -140,6 +142,31 @@ echo "   refusal: $(echo "$refusal" | grep -o '"msg":"[^"]*"')"
 check "search_text was refused for the path (the precondition)" '[ -n "$refusal" ]'
 check "it said the path is not there, not that it must be a directory" 'echo "$refusal" | grep -q "path not found: src/net/upload.rs" && ! (echo "$refusal" | grep -q "must be a directory")'
 check "it named where a file of that name is" 'echo "$refusal" | grep -q "the workspace has: src/upload.rs"'
+echo "################ 14. list_files on a file, preview 0 (bug report 20261119-115208)"
+# A child's `list_files` with preview 0 was refused by the schema ("Expected
+# value to be greater than or equal to 1") though the tool reads 0 as none, and
+# the parent's with a file's path was refused as "path must be a directory".
+since=$(date +%s%3N)
+say s1 "Gọi tool list_files đúng một lần với path 'src/upload.rs' và preview 0 (không có tham số nào khác), kể cả khi bạn nghĩ tham số sai. Không gọi tool nào khác. In nguyên văn toàn bộ kết quả tool, kể cả lỗi." | tail -6 | sed 's/^/   /'
+# This call's record only: an earlier section listed with a preview too.
+listed=$("$PY" - "$HA_HOME/data/diagnostics" "$since" <<'EOF' | tr -d '\r'
+import glob, json, os, sys
+found = []
+for path in glob.glob(os.path.join(sys.argv[1], "*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("kind") == "call" and r.get("event") == "settled" and r.get("ms", 0) >= int(sys.argv[2]) \
+                and r.get("fields", {}).get("tool") == "list_files":
+            found.append((r["ms"], line.strip()))
+print(max(found)[1] if found else "")
+EOF
+)
+echo "   settled: $(echo "$listed" | grep -oE '"(args_shape|ok|error_class)":[^,}]*' | tr '\n' ' ')"
+check "list_files was called with the path and preview (the precondition)" 'echo "$listed" | grep -q "path:string,preview:number"'
+check "it listed the file instead of refusing the call" 'echo "$listed" | grep -q "\"ok\":true" && last | grep -q "src/upload.rs"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

@@ -772,6 +772,19 @@ pub(crate) fn search_walk(
     root: &Path,
     requested: Option<&str>,
 ) -> Result<std::sync::Arc<Walk>, HarnessError> {
+    file_or_folder_walk(root, requested, "search_text", "search")
+}
+
+/// A folder's walk, or the walk of the one file `requested` names: what
+/// `search_text` and `list_files` read. `list_files path=<a file>` was refused
+/// with "path must be a directory" (bug report 20261119-115208), as the search
+/// was before it took a file.
+fn file_or_folder_walk(
+    root: &Path,
+    requested: Option<&str>,
+    tool: &str,
+    verb: &str,
+) -> Result<std::sync::Arc<Walk>, HarnessError> {
     let file = match requested {
         Some(path) => resolve_relative(root, path, true)?,
         None => root.to_owned(),
@@ -782,10 +795,12 @@ pub(crate) fn search_walk(
     if let Some(path) = requested
         && !file.exists()
     {
-        let mut message = format!("search_text path not found: {path}");
+        let mut message = format!("{tool} path not found: {path}");
         let found = files_named_like(root, path);
         if found.is_empty() {
-            message.push_str("; leave path out to search the whole workspace");
+            message.push_str("; leave path out to ");
+            message.push_str(verb);
+            message.push_str(" the whole workspace");
         } else {
             message.push_str("; the workspace has: ");
             message.push_str(&found.join(", "));
@@ -793,7 +808,7 @@ pub(crate) fn search_walk(
         return Err(HarnessError::new(ErrorCode::InvalidPayload, message));
     }
     if !file.is_file() {
-        return tool_walk(root, requested, "search_text");
+        return tool_walk(root, requested, tool);
     }
     let parent = file.parent().unwrap_or(root);
     let walk = cached_walk(root, parent, Some(Instant::now() + TOOL_WALK_DEADLINE))?;
@@ -806,7 +821,7 @@ pub(crate) fn search_walk(
     if files.is_empty() {
         return Err(HarnessError::new(
             ErrorCode::InvalidPayload,
-            "search_text path names a file the workspace search skips (ignored or sensitive)",
+            format!("{tool} path names a file the workspace {verb} skips (ignored or sensitive)"),
         ));
     }
     Ok(std::sync::Arc::new(Walk {
@@ -830,7 +845,7 @@ pub(crate) fn list_files(
     root: &Path,
     requested: Option<&str>,
 ) -> Result<(Vec<String>, bool), HarnessError> {
-    let walk = tool_walk(root, requested, "list_files")?;
+    let walk = file_or_folder_walk(root, requested, "list_files", "list")?;
     let mut paths = Vec::new();
     for file in walk.files.iter().take(MAX_SEARCH_MATCHES) {
         paths.push(root_relative(root, file)?);
@@ -854,7 +869,7 @@ pub(crate) fn preview_files(
     requested: Option<&str>,
     lines: u32,
 ) -> Result<Vec<crate::contracts::FilePreview>, HarnessError> {
-    let walk = tool_walk(root, requested, "list_files")?;
+    let walk = file_or_folder_walk(root, requested, "list_files", "list")?;
     let mut files = walk.files.iter().collect::<Vec<_>>();
     files.sort_by(|a, b| {
         a.relative
@@ -2369,6 +2384,31 @@ mod tests {
             2
         );
         assert!(search_text(&root, "needle", Some(".env"), false, false, None, 0, false).is_err());
+    }
+
+    /// Bug report 20261119-115208: `list_files` with a file's path was refused
+    /// with "`list_files` path must be a directory". It lists, and previews,
+    /// that file.
+    #[test]
+    fn list_files_lists_one_file_when_the_path_names_a_file() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::create_dir(directory.path().join("docs")).expect("docs");
+        fs::write(directory.path().join("docs/a.md"), "# A\n").expect("a");
+        fs::write(directory.path().join("docs/b.md"), "# B\n").expect("b");
+        fs::write(directory.path().join(".env"), "KEY=secret\n").expect("env");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let (paths, truncated) = list_files(&root, Some("docs/a.md")).expect("a file is listed");
+        assert_eq!(paths, ["docs/a.md"]);
+        assert!(!truncated);
+        let previews = preview_files(&root, Some("docs/a.md"), 5).expect("a file is previewed");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(list_files(&root, Some("docs")).expect("folder").0.len(), 2);
+        assert!(list_files(&root, Some(".env")).is_err());
+        let missing = list_files(&root, Some("docs/c.md")).expect_err("missing");
+        assert!(
+            missing.message().contains("list_files path not found"),
+            "{missing}"
+        );
     }
 
     /// Seen in a bug report: a guessed path (`host/application/refine_budget.rs`

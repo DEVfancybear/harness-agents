@@ -413,7 +413,22 @@ impl StrategyState {
             proposed: false,
         };
         if kind == DecisionKind::Switch {
-            let to = to.ok_or("task_state: a switch names the strategy it switches to")?;
+            // The alternative alone names the strategy: the list tells the
+            // model to switch "with decide.alternative set to its place" and to
+            // name it "if you like". Refused without a name, the switch came
+            // back twice in one session, each time right after a strategist
+            // answered (bug report 20261119-115208).
+            let chosen = alternative
+                .and_then(|place| place.checked_sub(1))
+                .and_then(|index| self.proposals.get(index))
+                .map(|proposal| Strategy {
+                    name: proposal.name.clone(),
+                    why: proposal.why.clone(),
+                    alternatives: Vec::new(),
+                });
+            let to = to.or(chosen).ok_or(
+                "task_state: a switch names the strategy it switches to: decide.strategy {name, why}, or decide.alternative with the place of a strategist's alternative",
+            )?;
             if same_name(&to.name, &from) {
                 return Err(format!(
                     "task_state: {from:?} is the current strategy; continue with it, or switch to another"
@@ -770,6 +785,40 @@ mod tests {
                 .decide(DecisionKind::Switch, Some(named("a")), String::new())
                 .is_err()
         );
+    }
+
+    /// Bug report 20261119-115208: the model took a strategist's alternative
+    /// as the list says - `decide.alternative`, the name left out "if you
+    /// like" - and was refused: "a switch names the strategy it switches to".
+    #[test]
+    fn a_switch_by_the_alternative_alone_takes_that_alternative() {
+        let mut state = StrategyState::default();
+        state.set(named("tune the regex"));
+        state.propose(vec![
+            Alternative {
+                name: "Use a parser".to_owned(),
+                why: "the input nests".to_owned(),
+                ..Alternative::default()
+            },
+            Alternative {
+                name: "Ask for a sample".to_owned(),
+                why: "the format is unknown".to_owned(),
+                ..Alternative::default()
+            },
+        ]);
+        let decision = state
+            .decide_taking(DecisionKind::Switch, None, "plateau".to_owned(), Some(2))
+            .expect("the alternative names the strategy");
+        assert!(decision.proposed);
+        assert_eq!(decision.to, "Ask for a sample");
+        let current = state.current.as_ref().expect("switched");
+        assert_eq!(current.name, "Ask for a sample");
+        assert_eq!(current.why, "the format is unknown");
+        // A place no alternative holds still needs a name.
+        let error = state
+            .decide_taking(DecisionKind::Switch, None, "again".to_owned(), Some(9))
+            .expect_err("nothing at place 9");
+        assert!(error.contains("decide.strategy"), "{error}");
     }
 
     #[test]

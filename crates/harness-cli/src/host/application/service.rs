@@ -9159,8 +9159,17 @@ enum GoalRecord {
 /// asked for alternatives while the question was open - 30 seconds before the
 /// question's turn could end, its message then taken as the person's answer
 /// (bug report 20261118-160828).
-fn evaluates_strategy(turn: &harness_tools::TurnOutcome) -> bool {
-    turn.pending_question.is_none()
+///
+/// Nor is a turn that ended while the conversation's children still work:
+/// their reports start the next turns, which read a report and change
+/// nothing, so each was an evaluation without progress. A child that worked
+/// 21 minutes brought the strategist in seven times, and the agent switched
+/// strategy twelve times (bug report 20261119-115208). The turn that ends
+/// with every child done is evaluated, the children's changes in it. A child
+/// that lives long holds the evaluation off as long: the goal, too, waits on
+/// its report rather than going on (`continue_goal`).
+fn evaluates_strategy(turn: &harness_tools::TurnOutcome, running_children: usize) -> bool {
+    turn.pending_question.is_none() && running_children == 0
 }
 
 #[cfg(test)]
@@ -9196,12 +9205,25 @@ mod evaluates_strategy_tests {
     #[test]
     fn a_turn_waiting_on_the_person_is_not_an_evaluation() {
         use harness_tools::TurnStop;
-        assert!(!super::evaluates_strategy(&turn(
-            TurnStop::NeedsInput,
-            Some(QuestionId::generate())
-        )));
-        assert!(super::evaluates_strategy(&turn(TurnStop::Final, None)));
-        assert!(super::evaluates_strategy(&turn(TurnStop::StepLimit, None)));
+        assert!(!super::evaluates_strategy(
+            &turn(TurnStop::NeedsInput, Some(QuestionId::generate())),
+            0
+        ));
+        assert!(super::evaluates_strategy(&turn(TurnStop::Final, None), 0));
+        assert!(super::evaluates_strategy(
+            &turn(TurnStop::StepLimit, None),
+            0
+        ));
+    }
+
+    /// Bug report 20261119-115208: the turns a working child's reports
+    /// started were each evaluated as no progress; seven strategists were
+    /// asked while the child was still at it.
+    #[test]
+    fn a_turn_that_ends_while_children_work_is_not_an_evaluation() {
+        use harness_tools::TurnStop;
+        assert!(!super::evaluates_strategy(&turn(TurnStop::Final, None), 1));
+        assert!(super::evaluates_strategy(&turn(TurnStop::Final, None), 0));
     }
 }
 
@@ -12018,7 +12040,9 @@ async fn run_turn(
     // A goal's turn that ended short of it is an evaluation of the strategy,
     // whether or not the model asked for one.
     if let Some(host) = &goal_host
-        && outcome.as_ref().is_ok_and(evaluates_strategy)
+        && outcome
+            .as_ref()
+            .is_ok_and(|turn| evaluates_strategy(turn, agents.running()))
         && !cancellation.is_cancelled()
     {
         host.evaluate_turn().await;

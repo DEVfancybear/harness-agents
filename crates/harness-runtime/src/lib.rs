@@ -1977,9 +1977,15 @@ pub struct RunResult {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPressure {
-    /// Well below it.
+    /// Well below it: at most [`CLEAR_PERCENT`] of it.
     #[default]
     Clear,
+    /// Between clear and near: on the way to the limit, or just back from it.
+    /// The estimate's scale moves with every response, so a context near the
+    /// limit read below it one step and near it the next; taken as clear, it
+    /// asked the model to save its state twice in 80 seconds on one approach
+    /// (bug report 20261119-115208).
+    Rising,
     /// Near it: the time for the model to save what it must not lose before
     /// the context is summarized.
     NearLimit,
@@ -1988,6 +1994,39 @@ pub enum ContextPressure {
     /// saw of the task's start is now a summary, so the host recites where the
     /// task stands near the newest message.
     Summarized,
+}
+
+/// The share of the compaction point at or under which a context is clear.
+pub const CLEAR_PERCENT: u64 = 60;
+
+/// Where a context of `scaled` estimated tokens stands against `threshold`:
+/// near it past four fifths, clear at [`CLEAR_PERCENT`] or under, and rising
+/// between them or past the threshold with no summary yet.
+#[must_use]
+pub fn pressure_of(scaled: u64, threshold: u64) -> ContextPressure {
+    if scaled <= threshold / 100 * CLEAR_PERCENT {
+        ContextPressure::Clear
+    } else if scaled > threshold / 5 * 4 && scaled <= threshold {
+        ContextPressure::NearLimit
+    } else {
+        ContextPressure::Rising
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::{ContextPressure, pressure_of};
+
+    /// Bug report 20261119-115208: one step at 79% of the threshold read as
+    /// clear, and the next at 80% asked the model to save its state again.
+    /// Only a context well below the limit is clear.
+    #[test]
+    fn a_context_just_below_the_limit_is_not_clear() {
+        assert_eq!(pressure_of(158_000, 200_000), ContextPressure::Rising);
+        assert_eq!(pressure_of(161_000, 200_000), ContextPressure::NearLimit);
+        assert_eq!(pressure_of(120_000, 200_000), ContextPressure::Clear);
+        assert_eq!(pressure_of(210_000, 200_000), ContextPressure::Rising);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3838,8 +3877,39 @@ fn message_bytes(messages: &[ProviderMessage]) -> usize {
                     .map(|call| call.call_id.len() + call.name.len() + call.arguments.len())
                     .sum::<usize>()
                 + message.tool_call_id.as_ref().map_or(0, String::len)
+                + images_bytes(&message.attachments)
         })
         .sum()
+}
+
+/// The bytes images stand for in the request's budget: what their pixels cost,
+/// not their base64. Counted as text, a 153 KiB screenshot raised the estimate
+/// by 58k tokens (bug report 20261119-115208); an image a later message still
+/// carries was not counted at all.
+fn images_bytes(images: &[harness_providers::ImageAttachment]) -> usize {
+    images
+        .iter()
+        .map(harness_providers::ImageAttachment::estimated_bytes)
+        .sum()
+}
+
+#[cfg(test)]
+mod image_bytes_tests {
+    /// Bug report 20261119-115208: a 153 KiB PNG raised a request's estimate
+    /// by 58k tokens. Its pixels cost about 1.5k; a message that still
+    /// carries it counts them.
+    #[test]
+    fn an_image_is_budgeted_by_its_pixels() {
+        // 153 KiB of bytes whose size cannot be read: the most one image costs.
+        let data = "A".repeat(153 * 1024 * 4 / 3);
+        let image = harness_providers::ImageAttachment::inline("image/png", data, "paste.png");
+        let bytes = super::images_bytes(std::slice::from_ref(&image));
+        assert!((2_000..=8_000).contains(&bytes), "{bytes}");
+        let mut message =
+            harness_providers::ProviderMessage::new(harness_providers::MessageRole::User, "look");
+        message.attachments.push(image);
+        assert_eq!(super::message_bytes(&[message]), 4 + bytes);
+    }
 }
 
 #[derive(Clone)]
@@ -4800,10 +4870,12 @@ impl RuntimeService {
         let mut summarized = false;
         // Whether this step wrote a checkpoint: the packet it sends is new.
         let mut checkpointed = request.overflow_retry;
-        let near_limit = matches!(&attempt, Ok(built)
-            if self.scaled_estimate(&config, built.packet.token_estimate)
-                > threshold / 5 * 4
-                && self.scaled_estimate(&config, built.packet.token_estimate) <= threshold);
+        let pressure = attempt.as_ref().map_or(ContextPressure::Rising, |built| {
+            pressure_of(
+                self.scaled_estimate(&config, built.packet.token_estimate),
+                threshold,
+            )
+        });
         if !fits(&attempt) {
             let keep = KEEP_RECENT_TOKENS.min(threshold / 4);
             let (older, recent, prefix) = match split_recent_aligned(
@@ -5744,12 +5816,12 @@ impl RuntimeService {
                 dispatchable,
                 finish_reason: response.finish_reason,
                 notices,
-                context: if summarized {
+                // A step tried again after an overflow compacted the session:
+                // its context is a summary too, and a new approach starts.
+                context: if summarized || request.overflow_retry {
                     ContextPressure::Summarized
-                } else if near_limit {
-                    ContextPressure::NearLimit
                 } else {
-                    ContextPressure::Clear
+                    pressure
                 },
             })
         } else {
@@ -7565,11 +7637,7 @@ impl RuntimeService {
         let fixed_request_bytes = request.system_policy.len()
             + request.text.len()
             + tool_bytes
-            + request
-                .images
-                .iter()
-                .map(|image| serde_json::to_string(image).map_or(0, |rendered| rendered.len()))
-                .sum::<usize>()
+            + images_bytes(&request.images)
             + message_bytes(&request.recovered_messages)
             + message_bytes(earlier)
             // The continuation transcript is sent with every step of a turn and

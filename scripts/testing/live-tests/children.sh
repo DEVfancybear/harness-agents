@@ -132,6 +132,10 @@ if not ends:
     sys.exit(2)
 between = [r for r in turns if r.get("event") == "start" and ends[-1] < r["ms"] < at]
 after = [r for r in turns if r.get("event") == "start" and at <= r["ms"] <= at + 10_000]
+# Bug report 20261119-115208: a turn that ended while the child worked was
+# evaluated as no progress, and the strategist was asked again and again.
+evaluated = [r for r in records if r.get("kind") == "strategy" and r.get("event") == "evaluated" and r["ms"] < at]
+print(f"   strategy evaluations while it worked: {len(evaluated)}")
 sys.exit(0 if not between and after else 3)
 PYEOF
 }
@@ -148,13 +152,14 @@ for attempt in 1 2 3; do
   done
   sleep 15
   echo "   attempt $attempt:"
-  waited "$since"; verdict=$?
+  waited "$since" | tee "$RX/c3.waited"; verdict=${PIPESTATUS[0]}
   "$HA" send "c3-$attempt" "/goal clear" --wait >/dev/null 2>&1
   "$HA" shutdown --force >/dev/null 2>&1
   [ "$verdict" -ne 1 ] && [ "$verdict" -ne 2 ] && break
 done
 check "the explorer outlived the turn that delegated" '[ "$verdict" -ne 1 ] && [ "$verdict" -ne 2 ]'
 check "no turn started while it worked; its report started the next" '[ "$verdict" -eq 0 ]'
+check "the goal's strategy was not evaluated while the child worked" '[ "$verdict" -ne 1 ] && [ "$verdict" -ne 2 ] && grep -q "strategy evaluations while it worked: 0" "$RX/c3.waited"'
 
 echo "################ 4. a review's record names its task"
 # A review after every turn, as knowledge.sh asks for one.

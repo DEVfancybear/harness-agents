@@ -906,7 +906,7 @@ fn apply_strategy(state: &mut TaskState, arguments: &Value) -> Result<(), Harnes
             .is_some_and(|current| current.name != strategy.name)
         {
             return Err(refused(
-                "task_state: the task already has a strategy; to change it, decide with kind switch and the evidence",
+                "task_state: the task already has a strategy; to change it, decide with kind switch, the evidence and the new strategy: decide {kind: switch, evidence, strategy: {name, why}}; nothing was written",
             ));
         }
         state.strategy.set(strategy);
@@ -1178,7 +1178,9 @@ impl TaskStateHost {
         let decided = state.strategy.decisions.last().cloned();
         let notes = apply(&mut state, arguments)?;
         state.revision += 1;
-        save(&self.path, &state).map_err(refused)?;
+        // The one failure after which the file may have changed: not a refusal.
+        save(&self.path, &state)
+            .map_err(|error| HarnessError::new(ErrorCode::StorageWriteFailed, error))?;
         if let Some(decision) = state
             .strategy
             .decisions
@@ -1291,16 +1293,38 @@ impl ExternalToolDispatcher for TaskStateHost {
             }
             let host = self.clone();
             let arguments = arguments.clone();
-            let payload = tokio::task::spawn_blocking(move || host.execute(&arguments))
+            let executed = tokio::task::spawn_blocking(move || host.execute(&arguments))
                 .await
-                .map_err(|error| refused(format!("task state operation failed: {error}")))??;
-            Ok(ToolOutput::ExternalTool {
-                plugin_id: "task".to_owned(),
-                tool_name: "task_state".to_owned(),
-                payload,
-                inflight: 1,
-            })
+                .map_err(|error| {
+                    HarnessError::new(
+                        ErrorCode::StorageWriteFailed,
+                        format!("task state operation failed: {error}"),
+                    )
+                })?;
+            dispatched(executed)
         })
+    }
+}
+
+/// What a call's result is to the model. A refused update wrote nothing, so
+/// it is a plain failure the model corrects and sends again; as an error it
+/// came back as "side effect may be uncertain; do not rerun automatically"
+/// (bug report 20261119-115208, three times in one session). Only a failed
+/// write, and a stale revision (a conflict the model reads and retries), stay
+/// errors.
+fn dispatched(executed: Result<Value, HarnessError>) -> Result<ToolOutput, HarnessError> {
+    match executed {
+        Ok(payload) => Ok(ToolOutput::ExternalTool {
+            plugin_id: "task".to_owned(),
+            tool_name: "task_state".to_owned(),
+            payload,
+            inflight: 1,
+        }),
+        Err(error) if error.code() == ErrorCode::InvalidPayload => Ok(ToolOutput::Denied {
+            code: error.code().as_str().to_owned(),
+            reason: error.message().to_owned(),
+        }),
+        Err(error) => Err(error),
     }
 }
 
@@ -1643,6 +1667,39 @@ mod tests {
         assert!(!host.path().exists());
         assert!(context_block(host.path()).is_none());
         assert!(recap(host.path()).is_none());
+    }
+
+    /// Bug report 20261119-115208: a refused update ("a switch names the
+    /// strategy it switches to") came back as "side effect may be uncertain;
+    /// do not rerun automatically", though nothing was written. A refusal is a
+    /// plain failure; only a failed write stays an error.
+    #[test]
+    fn a_refused_update_is_a_plain_failure_and_a_failed_write_is_not() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let host = host(root.path());
+        host.execute(&json!({"action":"update","strategy":{"name":"a"}}))
+            .expect("first");
+        let refused = host
+            .execute(&json!({"action":"update","decide":{"kind":"switch","evidence":"stalled"}}));
+        match dispatched(refused) {
+            Ok(ToolOutput::Denied { code, reason }) => {
+                assert_eq!(code, "invalid_payload");
+                assert!(reason.contains("decide.strategy"), "{reason}");
+            }
+            other => panic!("a refusal is a plain failure: {other:?}"),
+        }
+        assert_eq!(load(host.path()).revision, 1, "nothing was written");
+        // A file where the folder should be: the write fails.
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, "").expect("file");
+        let unwritable = TaskStateHost {
+            path: blocked.join(TASK_STATE_FILE),
+        };
+        let failed = unwritable.execute(&json!({"action":"update","objective":"x"}));
+        assert!(
+            dispatched(failed).is_err(),
+            "a failed write may have kept part of it"
+        );
     }
 
     #[test]

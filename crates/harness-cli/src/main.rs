@@ -1278,6 +1278,11 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             root,
             serve,
         }) => {
+            let role = if serve {
+                diagnostics::Role::Worker
+            } else {
+                diagnostics::Role::Supervisor
+            };
             let result =
                 interactive::agents::worker_command(&interactive::agents::worker::WorkerArgs {
                     registry,
@@ -1290,7 +1295,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             }
             // The worker's threads (its listener among them) end with the
             // process; waiting for them would keep it alive.
-            std::process::exit(i32::from(result.is_err()));
+            std::process::exit(worker_exit(&result, role));
         }
         Some(command) => {
             Box::pin(legacy_run(Cli {
@@ -2292,10 +2297,51 @@ fn store_error(error: StoreError) -> HarnessError {
     error.into_harness_error()
 }
 
+/// Record how a worker or supervisor ends, and the code it exits with. It
+/// leaves through `std::process::exit`, which skips the record `main` writes:
+/// every worker that stopped as it should had none, and a bug report took it
+/// for one "still running, or killed or crashed" (20261119-115208).
+fn worker_exit(result: &Result<ExitCode, HarnessError>, role: diagnostics::Role) -> i32 {
+    diagnostics::finish(result.as_ref().err(), role);
+    i32::from(result.is_err())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, ScheduleCommand};
     use clap::{CommandFactory, Parser};
+
+    /// Bug report 20261119-115208: a worker that logged "worker stopped" had
+    /// no exit record.
+    #[test]
+    fn a_worker_that_stops_records_its_exit() {
+        use super::diagnostics::Role;
+        let records = harness_types::diag::capture(|| {
+            assert_eq!(
+                super::worker_exit(&Ok(std::process::ExitCode::SUCCESS), Role::Worker),
+                0
+            );
+        });
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "process" && record.event == "exit"),
+            "{records:?}"
+        );
+        let failed = harness_types::HarnessError::new(
+            harness_types::ErrorCode::ServiceUnavailable,
+            "the registry is gone",
+        );
+        let records = harness_types::diag::capture(|| {
+            assert_eq!(super::worker_exit(&Err(failed), Role::Supervisor), 1);
+        });
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "process" && record.event == "failed"),
+            "{records:?}"
+        );
+    }
 
     #[test]
     fn the_command_line_is_well_formed() {

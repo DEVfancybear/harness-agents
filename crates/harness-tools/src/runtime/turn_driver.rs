@@ -3379,6 +3379,7 @@ impl TurnDriver {
                 let shown = announced.contains(&index);
                 let intervention = regulate(
                     &mut regulator,
+                    result.task_id.as_str(),
                     written.get(&transcript_id).map(String::as_str),
                     &name,
                     &transcript_id,
@@ -3737,7 +3738,12 @@ impl TurnDriver {
                 // whole (OpenClaw's flush before compaction). Asked once per
                 // turn, a goal's short turns were asked 54 times for nine
                 // summaries; the hooks remember it across turns.
-                if result.context != ContextPressure::NearLimit {
+                // Only a context well below the limit, or summarized, starts a
+                // new approach: one just below it is still this one.
+                if matches!(
+                    result.context,
+                    ContextPressure::Clear | ContextPressure::Summarized
+                ) {
                     hooks.flush_cleared();
                 }
                 if result.context == ContextPressure::NearLimit
@@ -5472,8 +5478,13 @@ const RULE_REFUSED: &str = "refused by a learned rule";
 /// Record a settled call - what it looked like and how it failed, for the
 /// diagnostics a later look at failures reads - and ask the regulator what the
 /// trajectory now shows.
+///
+/// The record names its conversation: without it, the failures of seven
+/// children and their parent read as one list nobody could split (bug report
+/// 20261119-115208).
 fn regulate(
     regulator: &mut crate::regulation::Regulator,
+    task: &str,
     written: Option<&str>,
     name: &str,
     transcript_id: &str,
@@ -5528,6 +5539,7 @@ fn regulate(
         harness_types::diag::Level::Info
     };
     let mut record = harness_types::diag::at(level, "call", "settled")
+        .task(task)
         .call(transcript_id)
         .field("tool", name.to_owned())
         .field("ok", failure.is_none())
@@ -5554,6 +5566,7 @@ fn regulate(
     let intervention = regulator.settle(name, &format!("{name}|{arguments}"), failure);
     if let Some(intervention) = &intervention {
         harness_types::diag::warn("regulation", intervention.kind)
+            .task(task)
             .call(transcript_id)
             .field("tool", name.to_owned())
             .msg(intervention.note.clone())
@@ -6797,6 +6810,32 @@ mod gate_phase_tests {
         assert_eq!((records[0].kind, records[0].event), ("tool", "gate_slow"));
         assert_eq!(records[0].fields["tool"], "web_search");
         assert_eq!(records[0].fields["approval_ms"], 90_000);
+    }
+}
+
+#[cfg(test)]
+mod settled_record_tests {
+    /// Bug report 20261119-115208: 52 failed calls of a parent and seven
+    /// children were recorded with no conversation to tell them apart.
+    #[test]
+    fn a_settled_call_names_its_conversation() {
+        let mut regulator = crate::regulation::Regulator::default();
+        let slot = super::Slot::Failed("refused".to_owned(), "bad".to_owned());
+        let records = harness_types::diag::capture(|| {
+            super::regulate(
+                &mut regulator,
+                "task_child",
+                Some("{}"),
+                "list_files",
+                "call_1",
+                &slot,
+            );
+        });
+        let settled = records
+            .iter()
+            .find(|record| (record.kind, record.event) == ("call", "settled"))
+            .expect("settled");
+        assert_eq!(settled.ids.task.as_deref(), Some("task_child"));
     }
 }
 

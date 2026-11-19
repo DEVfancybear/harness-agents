@@ -2105,8 +2105,23 @@ impl Report {
             for job in &jobs {
                 let state = if job.gave_up {
                     "gave up".to_owned()
-                } else if job.claimed.is_some() {
-                    "running or left by a process that died".to_owned()
+                } else if let Some(claim) = &job.claimed {
+                    // The claiming process's exit: one written after the claim
+                    // began, as a pid is soon used again.
+                    let claimed_at =
+                        claim.until - crate::interactive::sleep::LEASE.num_milliseconds();
+                    let ended = self.records.iter().any(|record| {
+                        record["pid"].as_u64() == Some(u64::from(claim.pid))
+                            && record["ms"].as_i64().is_some_and(|ms| ms >= claimed_at)
+                            && record["kind"].as_str() == Some("process")
+                            && matches!(record["event"].as_str(), Some("exit" | "failed"))
+                    });
+                    claim_state(
+                        claim.pid,
+                        claim.until,
+                        ended,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
                 } else {
                     chrono::DateTime::from_timestamp_millis(job.next_at).map_or_else(
                         || "waiting".to_owned(),
@@ -3080,6 +3095,29 @@ fn level_of(level: Option<&str>) -> &'static str {
     }
 }
 
+/// How a claimed sleep job stands: running in the process that claimed it, or
+/// left by one that ended. A review claimed eight seconds before the report by
+/// a process still at work read "running or left by a process that died"
+/// (bug report 20261119-115208).
+fn claim_state(pid: u32, until: i64, ended: bool, now: i64) -> String {
+    if ended {
+        format!(
+            "left by pid {pid}, which ended; another process takes it after {}",
+            ms_text(until)
+        )
+    } else if now > until {
+        format!(
+            "left by pid {pid}: its claim lapsed at {} (the process died or hung); another process takes it",
+            ms_text(until)
+        )
+    } else {
+        format!(
+            "running in pid {pid} (its claim lasts until {})",
+            ms_text(until)
+        )
+    }
+}
+
 fn ms_text(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map_or_else(
         || ms.to_string(),
@@ -3401,6 +3439,18 @@ pub async fn print_timeline(
 #[cfg(test)]
 mod tests {
     use super::{parse_window, withhold_secret_lines, zip};
+
+    /// Bug report 20261119-115208: a review claimed by a live process read
+    /// "running or left by a process that died". The claim says which.
+    #[test]
+    fn a_claimed_sleep_job_says_whether_its_process_is_still_at_it() {
+        let running = super::claim_state(4540, 2_000, false, 1_000);
+        assert!(running.starts_with("running in pid 4540"), "{running}");
+        let ended = super::claim_state(4540, 2_000, true, 1_000);
+        assert!(ended.contains("which ended"), "{ended}");
+        let lapsed = super::claim_state(4540, 2_000, false, 3_000);
+        assert!(lapsed.contains("lapsed"), "{lapsed}");
+    }
 
     /// Bug report 20261118-160828: a worker had no exit record because the
     /// computer went down under it (Windows: "the previous system shutdown
