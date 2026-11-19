@@ -2084,6 +2084,9 @@ async fn a16_process_tree_env() {
 
     // (1) The tree: a parent holds while its grandchild heartbeats, and the call
     // times out. The heartbeat must stop with the tree, not with the parent.
+    // The timeout leaves a loaded runner time to start the parent and its
+    // grandchild before the three heartbeats are counted: at two seconds, a CI
+    // runner building a release beside it saw none.
     let heartbeat = bench.temp.path().join("a16-heartbeat.txt");
     let env_out = bench.temp.path().join("a16-env.json");
     let mut args = vec!["--mode".to_owned(), "tree-parent".to_owned()];
@@ -2096,7 +2099,7 @@ async fn a16_process_tree_env() {
             task.clone(),
             "actor.a16",
             &bench.workspace,
-            tree_parent_action(args, 2_000, Vec::new()),
+            tree_parent_action(args, 6_000, Vec::new()),
         ))
         .await
         .expect("tree-parent prepares");
