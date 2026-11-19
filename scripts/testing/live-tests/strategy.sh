@@ -97,7 +97,10 @@ evaluated=$(records strategy evaluated "$since" | grep -vc '"source": "passed"')
 echo "   evaluations before passing: $evaluated"
 check "three evaluations or more under the first strategy (the precondition)" '[ "$evaluated" -ge 3 ]'
 check "the third was a plateau" 'records strategy evaluated "$since" | grep -q "\"plateau\": true"'
-check "a strategist named other strategies" 'records strategy proposed "$since" | grep -q proposed'
+# The precondition of the three checks on what it named: a strategist has
+# once used agent_message for notes to itself ("Keep final response JSON
+# Vietnamese") and ended saying it had sent its findings, never the JSON.
+check "a strategist named other strategies (the precondition)" 'records strategy proposed "$since" | grep -qE "\"count\": [1-9]"'
 # Evolving Agent Teams (arXiv 2610.36848): the strategist says why it stalled.
 check "and said why the strategy stalled" 'records strategy proposed "$since" | grep -q "\"diagnosed\": true"'
 check "the agent recorded a switch" 'records strategy decided "$since" | grep -q "\"kind\": \"switch\""'
