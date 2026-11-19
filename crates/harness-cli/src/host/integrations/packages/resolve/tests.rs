@@ -837,6 +837,56 @@ fn same_local_package_in_both_scopes_resolves_once_with_project_scope() {
 }
 
 #[test]
+fn a_package_that_is_one_skill_resolves_to_that_skill() {
+    let mut fixture = Fixture::new();
+    let skill = fixture.temp_dir.join("lone-skill");
+    write(
+        &skill.join("SKILL.md"),
+        "---
+name: lone-skill
+description: A skill published on its own
+---
+Content",
+    );
+    write(&skill.join("README.md"), "how to use it");
+    // A package with a skills directory keeps it: its root SKILL.md, if any,
+    // is not a second skill.
+    let both = fixture.temp_dir.join("both");
+    write(
+        &both.join("SKILL.md"),
+        "---
+name: both
+description: x
+---
+",
+    );
+    skill_md(&both.join("skills"), "inner", "The package's skill");
+
+    fixture.set_user_packages(serde_json::json!([
+        skill.display().to_string(),
+        both.display().to_string()
+    ]));
+
+    let result = fixture.manager.resolve().unwrap();
+    assert!(is_enabled(
+        &result.skills,
+        &format!("lone-skill{}SKILL.md", std::path::MAIN_SEPARATOR)
+    ));
+    assert!(is_enabled(
+        &result.skills,
+        &format!("inner{}SKILL.md", std::path::MAIN_SEPARATOR)
+    ));
+    assert!(
+        !has_path(
+            &result.skills,
+            &format!("both{}SKILL.md", std::path::MAIN_SEPARATOR)
+        ),
+        "{:?}",
+        result.skills
+    );
+}
+
+#[test]
 fn different_packages_in_both_scopes_both_resolve() {
     let mut fixture = Fixture::new();
     let pkg1 = fixture.temp_dir.join("pkg1");

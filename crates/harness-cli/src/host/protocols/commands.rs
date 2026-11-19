@@ -53,7 +53,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 74] = [
+pub const SLASH_COMMANDS: [SlashCommand; 75] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -108,6 +108,14 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
         "[add|list|get|remove|login|logout]",
         "Show MCP servers, or add, inspect and remove them",
     ),
+    SlashCommand {
+        aliases: &["/packages"],
+        ..command(
+            "/package",
+            "[install <source>|remove <source>|update [source]|list] [--local]",
+            "Install, remove, update and list packages of skills, prompts and themes",
+        )
+    },
     command(
         "/plugins",
         "[search]",
@@ -623,6 +631,8 @@ pub mod values {
     pub const HEARTBEATS: &str = "heartbeats";
     /// Configured MCP servers, by name (`/mcp get`).
     pub const MCP_SERVERS: &str = "mcp-servers";
+    /// Installed packages, by source (`/package remove`).
+    pub const PACKAGES: &str = "packages";
     /// Sessions of the last `/resume` listing, by id.
     pub const SESSIONS: &str = "sessions";
     /// Turns of the last `/fork` or `/tree` listing, by number.
@@ -788,6 +798,11 @@ const AUTONOMOUS_FLAGS: &[(&str, &str)] = &[
     ("--gate <command>", "end when this command passes"),
     ("--gate-retries <n>", "how often a failed gate is retried"),
 ];
+
+const PACKAGE_LOCAL: &[(&str, &str)] = &[(
+    "--local",
+    "the project's packages (.harness/settings.json), not the user's",
+)];
 
 const MCP_ADD_FLAGS: &[(&str, &str)] = &[
     ("--env KEY=VALUE", "an environment variable for the server"),
@@ -980,6 +995,25 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
         ("/mcp", ["get" | "remove" | "login" | "logout"]) => records(dynamic, values::MCP_SERVERS),
         ("/mcp", ["add", _, ..]) if !words.contains(&"--") && !takes_value(MCP_ADD_FLAGS, last) => {
             flags(MCP_ADD_FLAGS)
+        }
+        ("/package", []) => choose(&[
+            (
+                "install <source>",
+                "npm:@scope/name, git:github.com/user/repo, https://..., ./path",
+            ),
+            ("remove <source>", "remove an installed package"),
+            ("update [source]", "update every installed package, or one"),
+            ("list", "the installed packages"),
+        ]),
+        ("/package", ["remove" | "uninstall" | "rm"]) => Slot {
+            flags: fixed(PACKAGE_LOCAL),
+            ..records(dynamic, values::PACKAGES)
+        },
+        ("/package", ["update"]) => records(dynamic, values::PACKAGES),
+        ("/package", ["install" | "add" | "remove" | "uninstall" | "rm", ..])
+            if !words.contains(&"--local") =>
+        {
+            flags(PACKAGE_LOCAL)
         }
         ("/queue", []) => free(
             &[
@@ -1532,6 +1566,41 @@ mod tests {
         assert!(
             bare("/mcp add docs -- npx -").is_empty(),
             "after -- the command is the server's"
+        );
+    }
+
+    #[test]
+    fn package_offers_its_actions_the_installed_sources_and_local() {
+        let dynamic = records(&[(
+            values::PACKAGES,
+            &[
+                ("npm:@acme/skills", "user package"),
+                ("./tools/prompts", "project package (--local)"),
+            ],
+        )]);
+        assert_eq!(bare("/package "), ["install", "remove", "update", "list"]);
+        assert_eq!(
+            bare("/packages "),
+            bare("/package "),
+            "the alias completes too"
+        );
+        let install = rows("/package i", &dynamic);
+        assert_eq!(install[0].completion, "/package install ");
+        for action in ["remove", "update"] {
+            assert_eq!(
+                heads(&format!("/package {action} "), &dynamic),
+                ["npm:@acme/skills", "./tools/prompts"]
+            );
+        }
+        // A project package is found by what the menu says about it.
+        assert_eq!(heads("/package remove proj", &dynamic), ["./tools/prompts"]);
+        assert_eq!(heads("/package remove -", &dynamic), ["--local"]);
+        assert!(bare("/package install ").is_empty(), "the source is free");
+        assert_eq!(bare("/package install npm:x -"), ["--local"]);
+        assert!(bare("/package install npm:x --local -").is_empty());
+        assert!(
+            bare("/package update -").is_empty(),
+            "update has no --local"
         );
     }
 

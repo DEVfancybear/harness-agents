@@ -3168,6 +3168,11 @@ impl InteractiveController {
                     effects.push(Effect::Redraw);
                     return;
                 }
+                // A background change (a package installed, a sign-in done) can
+                // add commands and values: the menu reads them again when it
+                // next opens, not now.
+                self.menu_stale = true;
+                self.values_stale = true;
                 // An action that ran without a panel is announced before it runs. In
                 // the TUI that was one `[info] allowed by ...` row above every tool
                 // card - half the transcript of a read-heavy turn. The reason now rides
@@ -4693,6 +4698,25 @@ impl InteractiveController {
                 }
             }
             "/plugins" => self.plugins_command(raw_argument, &mut effects),
+            "/package" => {
+                // `ha package` in the app: a list answers in the panel; an
+                // install, removal or update starts and reports as notices.
+                let words = raw_argument
+                    .map(super::mcp_config::split_words)
+                    .unwrap_or_default();
+                match self.service.package(&words) {
+                    Ok(lines) if lines.len() == 1 => self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: lines.into_iter().next().unwrap_or_default(),
+                        },
+                    ),
+                    Ok(lines) => self.reference("/package", lines, &mut effects),
+                    Err(message) => {
+                        self.push_history(&mut effects, HistoryItem::Error { message });
+                    }
+                }
+            }
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
             "/autonomous" => self.autonomous_command(raw_argument, &mut effects),
