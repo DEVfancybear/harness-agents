@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# The Claude 5.5 models and Claude Fable 5.2 (claude-opus-5-5, claude-sonnet-5-5,
-# claude-haiku-5-5, claude-fable-5-2), as `ha exec --model anthropic/<id>` takes
-# them, with prime-agent's upstream catalog cached the way a day-old install
-# has it (it lists Sonnet 5.5 with a $0.20 cache read and no way to turn its
-# thinking off, and lacks Haiku 5.5 and Fable 5.2):
+# The Anthropic models ha lacked or had wrong in 0.9.14 - claude-opus-5-5,
+# claude-sonnet-5-5, claude-haiku-5-5, claude-fable-5-2 and the Mythos models
+# claude-mythos-5-2, claude-mythos-5-1 and claude-mythos-5 - as
+# `ha exec --model anthropic/<id>` takes them, with prime-agent's upstream
+# catalog cached the way a day-old install has it (it lists Sonnet 5.5 with a
+# $0.20 cache read and no way to turn its thinking off, and lacks the others
+# but Opus 5.5):
 #   1. each model is taken and its request reaches Anthropic's API - with no
 #      Anthropic credential, under a key the API refuses (401), never an
 #      unknown model or another provider; at `--thinking off` too;
 #   2. with ANTHROPIC_LIVE=1 and an Anthropic key in HA_CREDENTIALS_DIR or
 #      ANTHROPIC_API_KEY, each model answers a one-line task at `--thinking off`
 #      and at `low`, and the run's cost is priced (its parts add up to a total
-#      above 0). Without them these checks are skipped and said to be.
+#      above 0). Without them these checks are skipped and said to be. The
+#      Mythos models answer only an organization Anthropic has verified, so
+#      they are left out of 2 unless MYTHOS_LIVE=1 too.
 # Every check prints PASS or FAIL; the evidence stays in $LIVE_ROOT/claude-models.
 #
 #   bash scripts/testing/live-tests/claude-models.sh
@@ -20,7 +24,7 @@ fresh claude-models
 export HA_AUTO_REFINE=off
 P="$RX/p"
 project "$P"
-MODELS=(claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 claude-fable-5-2)
+MODELS=(claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 claude-fable-5-2 claude-mythos-5-2 claude-mythos-5-1 claude-mythos-5)
 
 # The upstream catalog, cached under the home's data directory as the daily
 # refresh leaves it (fresh, so this run does not download it again).
@@ -55,6 +59,9 @@ done
 echo "== each model answering (ANTHROPIC_LIVE=1)"
 if [ "${ANTHROPIC_LIVE:-0}" = 1 ]; then
   for id in "${MODELS[@]}"; do
+    case "$id" in
+      claude-mythos-*) if [ "${MYTHOS_LIVE:-0}" != 1 ]; then echo "   $id skipped: set MYTHOS_LIVE=1 for a verified organization's key"; continue; fi ;;
+    esac
     for level in off low; do
       (cd "$P" && "$HA" exec --json --model "anthropic/$id" --thinking "$level" --approval full-auto \
         "Answer with the single word: ready." >"$RX/live-$id-$level.json" 2>"$RX/live-$id-$level.err")

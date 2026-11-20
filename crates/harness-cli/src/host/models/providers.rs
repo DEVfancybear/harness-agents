@@ -750,9 +750,10 @@ mod tests {
         }
     }
 
-    /// The Claude 5.5 models and Fable 5.2, with Anthropic's prices (input,
-    /// output, cache read, cache write per million tokens), 1M context, 128K output and
-    /// the thinking levels each one takes.
+    /// The Claude 5.5 models, Fable 5.2 and the Mythos models (verified
+    /// organizations only), with Anthropic's prices (input, output, cache
+    /// read, cache write per million tokens), 1M context, 128K output and the
+    /// thinking levels each one takes.
     #[test]
     fn the_snapshot_has_the_claude_5_5_models_and_fable_5_2() {
         use harness_providers::ThinkingLevel::{High, Low, Max, Medium, Off, Xhigh};
@@ -776,6 +777,21 @@ mod tests {
             (
                 "claude-fable-5-2",
                 [8.0, 40.0, 0.2, 10.0],
+                &[Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-mythos-5-2",
+                [8.0, 40.0, 0.2, 10.0],
+                &[Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-mythos-5-1",
+                [10.0, 50.0, 0.25, 12.5],
+                &[Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-mythos-5",
+                [10.0, 50.0, 1.0, 12.5],
                 &[Low, Medium, High, Xhigh, Max][..],
             ),
         ] {

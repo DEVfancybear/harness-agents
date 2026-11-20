@@ -14282,8 +14282,9 @@ mod tests {
         (LaunchEnvironment::from_pairs(merged), directory)
     }
 
-    /// With an Anthropic key, `/model` offers Claude Opus, Sonnet and Haiku 5.5
-    /// and Claude Fable 5.2 under the names Anthropic gives them.
+    /// With an Anthropic key, `/model` offers Claude Opus, Sonnet and Haiku 5.5,
+    /// Claude Fable 5.2 and the Mythos models under the names Anthropic gives
+    /// them, a Mythos one saying who may call it.
     #[test]
     fn the_model_menu_offers_the_claude_5_5_models_and_fable_5_2() {
         let (environment, _credentials) =
@@ -14295,6 +14296,18 @@ mod tests {
             ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
             ("claude-haiku-5-5", "Claude Haiku 5.5"),
             ("claude-fable-5-2", "Claude Fable 5.2"),
+            (
+                "claude-mythos-5-2",
+                "Claude Mythos 5.2 (verified organizations only)",
+            ),
+            (
+                "claude-mythos-5-1",
+                "Claude Mythos 5.1 (verified organizations only)",
+            ),
+            (
+                "claude-mythos-5",
+                "Claude Mythos 5 (verified organizations only)",
+            ),
         ] {
             let reference = format!("anthropic/{id}");
             assert!(

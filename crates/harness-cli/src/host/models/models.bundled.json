@@ -166,6 +166,96 @@
    "pinned": true
   },
   {
+   "id": "claude-mythos-5",
+   "name": "Claude Mythos 5 (verified organizations only)",
+   "api": "anthropic-messages",
+   "provider": "anthropic",
+   "baseUrl": "https://api.anthropic.com",
+   "reasoning": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "cost": {
+    "input": 10,
+    "output": 50,
+    "cacheRead": 1,
+    "cacheWrite": 12.5
+   },
+   "contextWindow": 1000000,
+   "maxTokens": 128000,
+   "thinkingLevelMap": {
+    "off": null,
+    "minimal": null,
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "pinned": true
+  },
+  {
+   "id": "claude-mythos-5-1",
+   "name": "Claude Mythos 5.1 (verified organizations only)",
+   "api": "anthropic-messages",
+   "provider": "anthropic",
+   "baseUrl": "https://api.anthropic.com",
+   "reasoning": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "cost": {
+    "input": 10,
+    "output": 50,
+    "cacheRead": 0.25,
+    "cacheWrite": 12.5
+   },
+   "contextWindow": 1000000,
+   "maxTokens": 128000,
+   "thinkingLevelMap": {
+    "off": null,
+    "minimal": null,
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "pinned": true
+  },
+  {
+   "id": "claude-mythos-5-2",
+   "name": "Claude Mythos 5.2 (verified organizations only)",
+   "api": "anthropic-messages",
+   "provider": "anthropic",
+   "baseUrl": "https://api.anthropic.com",
+   "reasoning": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "cost": {
+    "input": 8,
+    "output": 40,
+    "cacheRead": 0.2,
+    "cacheWrite": 10
+   },
+   "contextWindow": 1000000,
+   "maxTokens": 128000,
+   "thinkingLevelMap": {
+    "off": null,
+    "minimal": null,
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max"
+   },
+   "pinned": true
+  },
+  {
    "id": "claude-opus-4-5",
    "name": "Claude Opus 4.5 (latest)",
    "api": "anthropic-messages",
