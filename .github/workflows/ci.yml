@@ -123,16 +123,18 @@ jobs:
   # Linux support and its platform-specific M12 probe results are in scope.
   #
   # The timeout is generous because each gate runs the whole workspace test suite
-  # as a regression step before its own required tests.
+  # as a regression step before its own required tests. M9 builds a release
+  # candidate first as well: it took 44 of its 45 minutes on 0.9.15 and was
+  # canceled at 45 on the next change, so it has more room.
   verify-milestones:
-    name: M-gates (${{ matrix.os }})
+    name: M-gates (${{ matrix.os }}, ${{ matrix.milestone }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest]
         milestone: [M0, M1, M2, M3, M4, M5, M6, M8, M9, M12]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.milestone == 'M9' && 75 || 45 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
