@@ -1534,7 +1534,8 @@ The learning loop's daily meditation ([LEARNING_LOOP.en.md](LEARNING_LOOP.en.md)
 §5) also reads the project's newest session logs, while session logs are on:
 at most 6, 4,000 characters each and 16,000 in all. It may report `signals`
 found in them: a correction or a wrong assumption one log shows again, or
-several show. Each signal's quote must be in the log it names, word for word;
+several show. Each signal's quote must be in the log it names (by its path, or by
+its file name when only one log has it), word for word;
 it is that log's conversation's signal, tagged with the log (`log` on the
 signal), and a lesson that already has a signal from that conversation gets
 none from its log. There is no new writer: the gate (3 signals across 2

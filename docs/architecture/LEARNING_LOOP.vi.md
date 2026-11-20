@@ -200,7 +200,8 @@ và các trích dẫn mới nhất. Nó trả về:
 - `signals`: khi session log đang bật, meditation cũng đọc các session log mới
   nhất của project (tối đa 6, mỗi log 4.000 ký tự, tổng 16.000) và báo một lời
   sửa hay một giả định sai mà một log lại cho thấy, hoặc nhiều log cùng cho
-  thấy, như một signal: câu trích phải nằm nguyên văn trong log nó nêu; đó là
+  thấy, như một signal: câu trích phải nằm nguyên văn trong log nó nêu (theo đường dẫn,
+  hoặc theo tên file khi chỉ một log có tên đó); đó là
   signal của cuộc hội thoại của log, gắn tên log; lesson đã có signal từ cuộc
   hội thoại đó không nhận thêm từ log của nó
   ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §17.6). Mỗi signal là một bản ghi

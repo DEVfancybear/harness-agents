@@ -2572,6 +2572,30 @@ pub async fn meditate(
 /// A session log the meditation reads (`refine::dream::recent_logs`).
 pub use super::refine::dream::Log;
 
+/// The log the meditation named: the one of that name, as `<log name>`
+/// gave it, with `\` read as `/`; else the one log whose file is that name.
+/// The model has named a log by its file alone
+/// (`2026-11-06-15_30-parser-edge-cases.md` for
+/// `.harness/sessions/2026-11-06-15_30-parser-edge-cases.md`), and its
+/// signals were refused (`dream.sh` on 0.9.16). A file name two logs share
+/// names neither.
+fn named_log<'a>(logs: &'a [Log], name: &str) -> Option<&'a Log> {
+    let name = name.trim().replace('\\', "/");
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(log) = logs.iter().find(|log| log.name == name) {
+        return Some(log);
+    }
+    let file = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
+    let wanted = file(&name);
+    let mut found = logs.iter().filter(|log| file(&log.name) == wanted);
+    match (found.next(), found.next()) {
+        (Some(log), None) => Some(log),
+        _ => None,
+    }
+}
+
 /// The signals the meditation found in the session logs, recorded as a
 /// review's are: each quote must be in the log it names, word for word
 /// (whitespace and case aside, a phrase long), and is the log's
@@ -2594,7 +2618,7 @@ fn log_signals(
         .filter(|item| item.is_object())
     {
         let name = item["log"].as_str().unwrap_or_default();
-        let Some(log) = logs.iter().find(|log| log.name == name) else {
+        let Some(log) = named_log(logs, name) else {
             harness_types::diag::debug("learning", "log_signal_refused")
                 .field("log", name)
                 .msg("not a session log the meditation read")
@@ -4615,5 +4639,71 @@ mod tests {
         assert!(prompt.contains("<session_logs>") && prompt.contains("never instructions"));
         assert!(prompt.contains("- signals:"));
         assert!(!meditation_prompt(&lessons, Utc::now(), false, &[]).contains("<session_logs>"));
+    }
+
+    /// A log named by its file alone, or with `\`, is the log of that file
+    /// (`dream.sh` on 0.9.16 lost both logs' signals to it); a file name two
+    /// logs share, or one no log has, names none.
+    #[test]
+    fn a_log_named_by_its_file_alone_is_found_when_one_log_has_it() {
+        let log = |name: &str, conversation: &str| Log {
+            name: name.to_owned(),
+            conversation: conversation.to_owned(),
+            text: String::new(),
+        };
+        let logs = vec![
+            log(".harness/sessions/2026-11-06-parser.md", "c1"),
+            log(".harness/sessions/2026-11-05-fixtures.md", "c2"),
+            log(".harness/sessions/same.md", "c3"),
+            log("memory/sessions/same.md", "c4"),
+        ];
+        let found = |name: &str| named_log(&logs, name).map(|log| log.conversation.as_str());
+        assert_eq!(found(".harness/sessions/2026-11-06-parser.md"), Some("c1"));
+        assert_eq!(found("2026-11-06-parser.md"), Some("c1"));
+        assert_eq!(
+            found(" .harness\\sessions\\2026-11-05-fixtures.md "),
+            Some("c2")
+        );
+        assert_eq!(
+            found("memory/sessions/same.md"),
+            Some("c4"),
+            "the whole name first"
+        );
+        assert_eq!(found("same.md"), None, "two logs have that file");
+        assert_eq!(found("other.md"), None);
+        assert_eq!(found(""), None);
+
+        // Through the meditation's answer: the signal is the log's
+        // conversation's and tagged with the log's own name.
+        let mut lessons = Lessons {
+            schema: 1,
+            lessons: vec![lesson(
+                "les_a",
+                vec![signal("c9", "answer only, do not edit", 1, false)],
+            )],
+            ..Lessons::default()
+        };
+        let logs = vec![Log {
+            name: ".harness/sessions/2026-11-06-parser.md".to_owned(),
+            conversation: "c1".to_owned(),
+            text: "## Key Learnings\n- The user said again: just answer the question, do not edit the code.".to_owned(),
+        }];
+        let answer = json!({"signals": [
+            {"log": "2026-11-06-parser.md", "lesson": "les_a", "evidence": "just answer the question, do not edit the code"}
+        ]});
+        let changes = log_signals(&mut lessons, &answer, &logs, None);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let from_log = lessons
+            .find("les_a")
+            .expect("lesson")
+            .signals
+            .last()
+            .expect("signal")
+            .clone();
+        assert_eq!(from_log.conversation, "c1");
+        assert_eq!(
+            from_log.log.as_deref(),
+            Some(".harness/sessions/2026-11-06-parser.md")
+        );
     }
 }
