@@ -14282,6 +14282,30 @@ mod tests {
         (LaunchEnvironment::from_pairs(merged), directory)
     }
 
+    /// With an Anthropic key, `/model` offers Claude Opus, Sonnet and Haiku 5.5
+    /// and Claude Fable 5.2 under the names Anthropic gives them.
+    #[test]
+    fn the_model_menu_offers_the_claude_5_5_models_and_fable_5_2() {
+        let (environment, _credentials) =
+            credential_environment(&[("ANTHROPIC_API_KEY", "sk-ant-fixture-not-a-key")]);
+        let data = tempfile::tempdir().expect("data directory");
+        let options = super::catalog_options(&environment, data.path());
+        for (id, name) in [
+            ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            ("claude-haiku-5-5", "Claude Haiku 5.5"),
+            ("claude-fable-5-2", "Claude Fable 5.2"),
+        ] {
+            let reference = format!("anthropic/{id}");
+            assert!(
+                options
+                    .iter()
+                    .any(|(value, label)| *value == reference && label == name),
+                "{reference} is not offered: {options:?}"
+            );
+        }
+    }
+
     async fn record_project_session(
         store: &Arc<SqliteStore>,
         workspace_root: &std::path::Path,

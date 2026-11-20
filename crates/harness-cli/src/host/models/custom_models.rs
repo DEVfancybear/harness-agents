@@ -238,6 +238,7 @@ fn build(
             output: cost.output,
             cache_read: cost.cache_read,
             cache_write: cost.cache_write,
+            long_prompt: None,
         })),
         context_window: Some(definition.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
         max_tokens_explicit: definition.max_tokens.is_some(),
@@ -245,6 +246,7 @@ fn build(
         compat: definition.compat,
         thinking_level_map: None,
         key_variable: None,
+        pinned: false,
     };
     if model.protocol().is_none() {
         return Err(format!(

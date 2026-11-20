@@ -190,6 +190,12 @@ pub struct Model {
     /// catalog value is capped (prime-agent's `maxTokensExplicit`).
     #[serde(skip)]
     pub max_tokens_explicit: bool,
+    /// The snapshot's entry wins over a downloaded one for the same model:
+    /// set where the upstream catalog had the model wrong (in 0.9.14 it priced
+    /// Claude Sonnet 5.5's cache read at $0.20, not $0.10, and sent its off as
+    /// `disabled`, which the API refuses). Only the snapshot's flag counts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// prime-agent's `REQUEST_MAX_TOKENS_CAP`: catalogs advertise far more output
@@ -199,6 +205,26 @@ pub const REQUEST_MAX_TOKENS_CAP: u64 = 32_000;
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+    /// A second rate card for a prompt longer than its threshold (Claude
+    /// Haiku 5.5 costs five times as much above 100K prompt tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_prompt: Option<LongPromptCost>,
+}
+
+/// The rates a model charges for every token of a call whose prompt is longer
+/// than `above` tokens.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongPromptCost {
+    pub above: u64,
     #[serde(default)]
     pub input: f64,
     #[serde(default)]
@@ -357,8 +383,16 @@ impl Catalog {
     /// Seen in 0.9.2: the upstream catalog listed `gpt-6.1-sol` but not
     /// `gpt-6.1-terra`, which the `ChatGPT` backend serves, so once the download
     /// was cached `/model` no longer offered the model the snapshot had. The
-    /// download still wins for every model both of them have.
+    /// download still wins for every model both of them have, except one the
+    /// snapshot pins.
     fn keep_snapshot_models(&mut self, snapshot: &Self) {
+        for pinned in snapshot.models.iter().filter(|model| model.pinned) {
+            for known in &mut self.models {
+                if known.provider == pinned.provider && known.id == pinned.id {
+                    known.clone_from(pinned);
+                }
+            }
+        }
         let missing = snapshot
             .models
             .iter()
@@ -403,6 +437,7 @@ impl Catalog {
         id.clone_into(&mut model.id);
         id.clone_into(&mut model.name);
         model.cost = None;
+        model.pinned = false;
         Some(model)
     }
 
@@ -715,6 +750,66 @@ mod tests {
         }
     }
 
+    /// The Claude 5.5 models and Fable 5.2, with Anthropic's prices (input,
+    /// output, cache read, cache write per MTok), 1M context, 128K output and
+    /// the thinking levels each one takes.
+    #[test]
+    fn the_snapshot_has_the_claude_5_5_models_and_fable_5_2() {
+        use harness_providers::ThinkingLevel::{High, Low, Max, Medium, Off, Xhigh};
+        let catalog = Catalog::bundled();
+        for (id, price, levels) in [
+            (
+                "claude-opus-5-5",
+                [4.0, 20.0, 0.2, 5.0],
+                &[Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-sonnet-5-5",
+                [2.0, 10.0, 0.1, 2.5],
+                &[Off, Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-haiku-5-5",
+                [0.1, 0.5, 0.01, 0.125],
+                &[Off, Low, Medium, High, Xhigh, Max][..],
+            ),
+            (
+                "claude-fable-5-2",
+                [8.0, 40.0, 0.2, 10.0],
+                &[Low, Medium, High, Xhigh, Max][..],
+            ),
+        ] {
+            let model = catalog
+                .find(&format!("anthropic/{id}"))
+                .unwrap_or_else(|| panic!("anthropic/{id} is in the snapshot"));
+            assert_eq!(model.protocol(), Some("anthropic_messages"), "{id}");
+            assert_eq!(model.context_window, Some(1_000_000), "{id}");
+            assert_eq!(model.max_tokens, Some(128_000), "{id}");
+            let cost = model.cost.expect("priced");
+            let listed = [cost.input, cost.output, cost.cache_read, cost.cache_write];
+            assert!(
+                listed
+                    .iter()
+                    .zip(price)
+                    .all(|(listed, price)| (listed - price).abs() < 1e-9),
+                "{id}: {listed:?}"
+            );
+            assert_eq!(
+                harness_providers::thinking::supported_levels(Some(model.reasoning_model())),
+                levels,
+                "{id}"
+            );
+            assert!(
+                harness_providers::thinking::supports_adaptive_thinking(id),
+                "{id}"
+            );
+        }
+        let haiku = catalog.find("anthropic/claude-haiku-5-5").expect("haiku");
+        let long = haiku.cost.and_then(|cost| cost.long_prompt).expect("tiers");
+        assert_eq!(long.above, 100_000);
+        assert!((long.input - 0.5).abs() < 1e-9 && (long.output - 2.5).abs() < 1e-9);
+    }
+
     #[test]
     fn each_wire_format_gets_the_url_its_sdk_would_call() {
         let catalog = Catalog::bundled();
@@ -828,6 +923,40 @@ mod tests {
         );
         assert!(catalog.find("openai-codex/gpt-6.1-terra").is_some());
         assert!(catalog.find("openai/gpt-6.1-terra").is_some());
+        // Claude Sonnet 5.5 is pinned: the upstream catalog's copy of it (cache
+        // read $0.20, off sent as `disabled`) does not replace the snapshot's.
+        let mut upstream = file["models"][0].clone();
+        upstream["id"] = "claude-sonnet-5-5".into();
+        upstream["provider"] = "anthropic".into();
+        upstream["api"] = "anthropic-messages".into();
+        upstream["baseUrl"] = "https://api.anthropic.com".into();
+        upstream["cost"] =
+            serde_json::json!({"input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5});
+        upstream["thinkingLevelMap"] = serde_json::json!({"minimal": null, "low": "low"});
+        file["models"] = serde_json::json!([file["models"][0].clone(), upstream]);
+        std::fs::write(&path, file.to_string()).expect("cache written");
+        let catalog = Catalog::load_files(data.path());
+        let sonnet = catalog
+            .find("anthropic/claude-sonnet-5-5")
+            .expect("anthropic/claude-sonnet-5-5");
+        assert!(
+            (sonnet.cost.expect("priced").cache_read - 0.1).abs() < 1e-9,
+            "{sonnet:?}"
+        );
+        assert_eq!(
+            sonnet
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get("off").cloned()),
+            Some(Some("between_tools".to_owned()))
+        );
+        assert_eq!(
+            catalog
+                .for_provider("anthropic")
+                .filter(|model| model.id == "claude-sonnet-5-5")
+                .count(),
+            1
+        );
         assert_eq!(
             catalog
                 .for_provider("openai-codex")

@@ -1336,6 +1336,7 @@ fn apply_models(
                     output_per_mtok: output,
                     cache_read_per_mtok: None,
                     cache_write_per_mtok: None,
+                    long_prompt: None,
                 },
             );
             set_explain(
