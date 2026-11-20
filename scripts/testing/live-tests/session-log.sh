@@ -229,7 +229,19 @@ say v2 "Trả lời đúng một từ: cam" > "$RX/v2.out" 2>&1
 wait_for "$V/.harness/sessions/*.md" 60
 check "a turn in the second pane writes no log of the conversation open in the first" '[ -n "$VOWED" ] && ! grep -qs "Conversation:\*\* $VOWED" "$V"/.harness/sessions/*.md'
 check "which still owes it" '[ -n "$VOWEDF" ] && [ -e "$VOWEDF" ]'
-check "and the second pane was told of no log" '! grep -q "session log" "$RX/v2.out"'
+# How many times the log of conversation $1 was recorded written: the record
+# comes with the write, whenever the notice of it reaches a pane.
+written() { "$PY" - "$D/diagnostics" "$1" <<'EOF'
+import glob, json, os, sys
+n = 0
+for path in glob.glob(os.path.join(sys.argv[1], "*.jsonl")):
+    for line in open(path, encoding="utf-8"):
+        r = json.loads(line)
+        n += r.get("kind") == "session_log" and r.get("event") == "written" and r.get("task") == sys.argv[2]
+print(n)
+EOF
+}
+check "and no write of it was recorded" '[ -n "$VOWED" ] && [ "$(written "$VOWED" | tr -d "\r")" -eq 0 ]'
 "$HA" send v1 "/new -- Trả lời đúng một từ: xong" --wait > "$RX/v1-new.out" 2>&1
 wait_for "$V/.harness/sessions/*.md" 120; sleep 2
 VLOG=$(grep -ls "Conversation:\*\* $VOWED" "$V"/.harness/sessions/*.md | head -1)

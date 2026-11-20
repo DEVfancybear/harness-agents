@@ -104,6 +104,8 @@ struct Report {
     /// conversation 43 seconds before read "no exit record - still running,
     /// or killed or crashed" under Problems (bug report 20261120-135928).
     running: BTreeMap<u64, i64>,
+    /// The process writing the report, which has no exit record yet.
+    this_pid: u64,
 }
 
 /// Parse `30m`, `2h`, `3d`, `90s` (a bare number is hours).
@@ -205,6 +207,7 @@ async fn gather(options: Options) -> Result<Report, HarnessError> {
         redactions: 0,
         booted_ms: crate::boot::booted_ms(now_ms()),
         running: BTreeMap::new(),
+        this_pid: u64::from(std::process::id()),
     };
     if let Some(task) = &report.options.task {
         report.conversations.insert(task.clone());
@@ -790,6 +793,14 @@ impl Report {
                 if !self.wanted(task.as_deref(), column(cells, "session_id").as_deref()) {
                     continue;
                 }
+                // A step whose run is gone names no conversation: in a report
+                // of one, it is not known to be that one's.
+                if name == "run_steps"
+                    && task.is_none()
+                    && (self.options.task.is_some() || self.options.session.is_some())
+                {
+                    continue;
+                }
                 if let Some(task) = &task
                     && self.options.task.is_none()
                     && name == "sessions"
@@ -1137,15 +1148,17 @@ impl Report {
     }
 
     /// Whether the `role` process `pid` that started at `started_ms` runs
-    /// now: a worker whose live descriptor names that pid and a start within
-    /// a few seconds of its start record, so a pid used again is not taken
-    /// for it.
+    /// now: the process writing the report, or a worker whose live
+    /// descriptor names that pid and a start in the minute after its start
+    /// record (the descriptor is written once the worker holds the project's
+    /// lock, which it may wait seconds for), so a pid used again by a later
+    /// process is not taken for it.
     fn runs_now(&self, role: &str, pid: u64, started_ms: i64) -> bool {
-        role == "worker"
-            && self
-                .running
-                .get(&pid)
-                .is_some_and(|started| started.abs_diff(started_ms) <= 5_000)
+        (pid == self.this_pid && self.this_pid != 0)
+            || (role == "worker"
+                && self.running.get(&pid).is_some_and(|started| {
+                    *started >= started_ms && *started - started_ms <= 60_000
+                }))
     }
 
     /// Each process whose log starts and never says how it ended: its role,
@@ -3543,6 +3556,7 @@ mod tests {
             redactions: 0,
             booted_ms: Some(3_000),
             running: std::collections::BTreeMap::new(),
+            this_pid: 0,
         };
         let unclean = report.unclean_exits();
         assert_eq!(unclean.len(), 2, "{unclean:?}");
@@ -3586,6 +3600,10 @@ mod tests {
                 record(20980, 1_000_000, "process", "start"),
                 record(20980, 1_050_000, "turn", "terminal"),
                 record(7000, 1_000_000, "process", "start"),
+                record(8000, 1_000_000, "process", "start"),
+                record(9000, 1_000_000, "process", "start"),
+                serde_json::json!({"role": "tui", "pid": 4242, "ms": 1_000_000,
+                    "kind": "process", "event": "start", "ts": super::ms_text(1_000_000)}),
             ],
             store_problems: std::collections::BTreeMap::new(),
             log_panics: std::collections::BTreeMap::new(),
@@ -3595,27 +3613,85 @@ mod tests {
             known_secrets: Vec::new(),
             redactions: 0,
             booted_ms: Some(10),
-            // 20980's descriptor started 12 ms after its start record; 7000's
-            // pid belongs to a worker that started an hour later.
-            running: [(20980, 1_000_012), (7000, 4_600_000)]
-                .into_iter()
-                .collect(),
+            // 20980's descriptor started 12 ms after its start record, and
+            // 8000's 8 s after (it waited for the project's lock); 7000's pid
+            // belongs to a worker that started an hour later, 9000's to one
+            // that started before the record's.
+            running: [
+                (20980, 1_000_012),
+                (8000, 1_008_000),
+                (7000, 4_600_000),
+                (9000, 990_000),
+            ]
+            .into_iter()
+            .collect(),
+            // The terminal writing the report.
+            this_pid: 4242,
         };
         let unclean = report.unclean_exits();
-        assert_eq!(unclean.len(), 1, "{unclean:?}");
+        assert_eq!(unclean.len(), 2, "{unclean:?}");
         assert!(unclean[0].starts_with("worker pid 7000"), "{unclean:?}");
-        assert_eq!(report.problem_count(), 1);
+        assert!(unclean[1].starts_with("worker pid 9000"), "{unclean:?}");
+        assert_eq!(report.problem_count(), 2);
         let running = report.running_now();
-        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running.len(), 3, "{running:?}");
+        assert!(running[0].starts_with("tui pid 4242"), "{running:?}");
+        assert!(running[1].starts_with("worker pid 8000"), "{running:?}");
         assert!(
-            running[0].starts_with("worker pid 20980")
-                && running[0].contains("runs as the report is written")
-                && running[0].contains("turn.terminal"),
+            running[2].starts_with("worker pid 20980")
+                && running[2].contains("runs as the report is written")
+                && running[2].contains("turn.terminal"),
             "{running:?}"
         );
         let mut header = String::new();
         report.summary_header(&mut header);
         assert!(header.contains("- running: worker pid 20980"), "{header}");
+    }
+
+    /// Bug report 20261120-135928: a report of one conversation held 28 run
+    /// steps, 4 of them its own. A step now carries its run's conversation;
+    /// one whose run is gone names none and is left out of a report of one.
+    #[test]
+    fn a_report_of_one_conversation_keeps_its_own_steps() {
+        let mut report = super::Report {
+            options: super::Options {
+                since: std::time::Duration::from_hours(24),
+                task: Some("task-a".to_owned()),
+                session: None,
+                include_content: false,
+            },
+            since_ms: 0,
+            data_dir: std::path::PathBuf::new(),
+            files: std::collections::BTreeMap::new(),
+            points: Vec::new(),
+            records: Vec::new(),
+            store_problems: std::collections::BTreeMap::new(),
+            log_panics: std::collections::BTreeMap::new(),
+            conversations: std::collections::BTreeSet::new(),
+            children: std::collections::BTreeMap::new(),
+            notes: Vec::new(),
+            known_secrets: Vec::new(),
+            redactions: 0,
+            booted_ms: None,
+            running: std::collections::BTreeMap::new(),
+            this_pid: 0,
+        };
+        let tables = serde_json::json!({"run_steps": {
+            "columns": ["step_id", "run_id", "step_index", "request_id", "state", "stop_reason", "session_id", "task_id"],
+            "rows": [
+                ["step-a", "run-a", 0, "request-a", "streamed", null, "session-a", "task-a"],
+                ["step-b", "run-b", 0, "request-b", "streamed", null, "session-b", "task-b"],
+                ["step-gone", "run-gone", 0, "request-gone", "streamed", null, null, null],
+            ],
+        }});
+        let kept = report.filter_tables("project-x", tables);
+        let steps = kept["run_steps"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row[0].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(steps, ["step-a"]);
     }
 
     #[test]

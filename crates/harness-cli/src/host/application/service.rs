@@ -5222,6 +5222,9 @@ impl SessionPort for AgentSessionService {
             return;
         };
         for (task, session) in owed {
+            // The conversation left is this pane's; any other is one a crash
+            // or a closed pane left, and says so.
+            let trigger = if task == self.task_id { "left" } else { "owed" };
             spawn_session_log(
                 self.sender.clone(),
                 self.store_dir.clone(),
@@ -5229,7 +5232,7 @@ impl SessionPort for AgentSessionService {
                 session,
                 task,
                 Arc::clone(&provider),
-                "left",
+                trigger,
                 None,
             );
         }
@@ -6691,13 +6694,15 @@ impl SessionPort for AgentSessionService {
         let (source, task) = selection.map_or((None, None), |(session, task)| {
             (Some(session), Some(task.as_str().to_owned()))
         });
+        // Claimed first: a conversation another agent runs is refused, and
+        // the pane stays in, and holds, the one it has.
+        self.agents.claim_conversation(next_task.as_str())?;
         // The conversation being left gets its session log now.
         self.conversation_left();
         let mut previous = self
             .previous_session
             .lock()
             .map_err(|_| "conversation state is unavailable; nothing was resumed".to_owned())?;
-        self.agents.claim_conversation(next_task.as_str())?;
         // Selection is synchronous: submit cannot overtake a background lookup.
         // The turn validates ownership in this project's store before dispatch.
         // The children worked for the conversation being left; they stop quietly.

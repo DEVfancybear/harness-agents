@@ -5658,7 +5658,7 @@ const BUG_REPORT_TABLES: &[(&str, &str, &str)] = &[
     // report 20261120-135928 held 28 steps, 4 of them its conversation's).
     (
         "run_steps",
-        "SELECT run_steps.step_id, run_steps.run_id, run_steps.step_index, run_steps.request_id, run_steps.state, run_steps.stop_reason, runs.session_id, runs.task_id FROM run_steps LEFT JOIN runs ON runs.run_id = run_steps.run_id ORDER BY run_steps.rowid DESC LIMIT 600",
+        "SELECT run_steps.step_id AS step_id, run_steps.run_id AS run_id, run_steps.step_index AS step_index, run_steps.request_id AS request_id, run_steps.state AS state, run_steps.stop_reason AS stop_reason, runs.session_id AS session_id, runs.task_id AS task_id FROM run_steps LEFT JOIN runs ON runs.run_id = run_steps.run_id ORDER BY run_steps.rowid DESC LIMIT 600",
         "",
     ),
     (

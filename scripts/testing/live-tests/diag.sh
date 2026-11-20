@@ -250,13 +250,18 @@ z = zipfile.ZipFile(sys.argv[1])
 own = other = 0
 for name in z.namelist():
     if name.startswith("store/project-") and name.endswith(".json") and name.count("/") == 1:
-        steps = json.loads(z.read(name))["run_steps"]
+        tables = json.loads(z.read(name))
+        steps = tables["run_steps"]
         if "task_id" not in steps["columns"]:
             other += len(steps["rows"])
             continue
+        # The conversation's own: it and the children it delegated to, as the
+        # report's runs name them.
+        runs = tables["runs"]
+        kept = {row[runs["columns"].index("task_id")] for row in runs["rows"]} | {sys.argv[2]}
         task = steps["columns"].index("task_id")
         for row in steps["rows"]:
-            if row[task] == sys.argv[2]:
+            if row[task] in kept:
                 own += 1
             else:
                 other += 1
