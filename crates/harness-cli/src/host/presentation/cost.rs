@@ -9,6 +9,21 @@ pub struct ModelPrice {
     /// write to it. `None` prices them as ordinary input.
     pub cache_read_per_mtok: Option<f64>,
     pub cache_write_per_mtok: Option<f64>,
+    /// The rates for a call whose prompt is longer than a threshold, when the
+    /// model has a second rate card (Claude Haiku 5.5 above 100K tokens).
+    pub long_prompt: Option<LongPromptPrice>,
+}
+
+/// Every token of a call whose prompt has more than `above_tokens` is priced
+/// at these rates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::struct_field_names)] // the catalog's price names
+pub struct LongPromptPrice {
+    pub above_tokens: u64,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub cache_read_per_mtok: f64,
+    pub cache_write_per_mtok: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -30,7 +45,30 @@ impl ModelPrice {
             output_per_mtok: cost.output,
             cache_read_per_mtok: Some(cost.cache_read),
             cache_write_per_mtok: Some(cost.cache_write),
+            long_prompt: cost.long_prompt.map(|long| LongPromptPrice {
+                above_tokens: long.above,
+                input_per_mtok: long.input,
+                output_per_mtok: long.output,
+                cache_read_per_mtok: long.cache_read,
+                cache_write_per_mtok: long.cache_write,
+            }),
         })
+    }
+
+    /// The rates a call whose prompt (`input_tokens`, cache included) has
+    /// `prompt_tokens` pays.
+    #[must_use]
+    pub const fn for_prompt(self, prompt_tokens: u64) -> Self {
+        match self.long_prompt {
+            Some(long) if prompt_tokens > long.above_tokens => Self {
+                input_per_mtok: long.input_per_mtok,
+                output_per_mtok: long.output_per_mtok,
+                cache_read_per_mtok: Some(long.cache_read_per_mtok),
+                cache_write_per_mtok: Some(long.cache_write_per_mtok),
+                long_prompt: None,
+            },
+            _ => self,
+        }
     }
 }
 
@@ -219,7 +257,7 @@ pub fn calculate_cost(price: Option<ModelPrice>, usage: Usage) -> Option<f64> {
 /// price that is not set is the input price. `None` when the model has no
 /// price. `calculate_cost` is this function's `total`.
 pub fn split_cost(price: Option<ModelPrice>, usage: Usage) -> Option<CostParts> {
-    let price = price?;
+    let price = price?.for_prompt(usage.input_tokens);
     let tokens = |count: u64| u32::try_from(count).ok().map(f64::from);
     let uncached = usage
         .input_tokens
@@ -357,6 +395,7 @@ mod tests {
             output_per_mtok: 30.0,
             cache_read_per_mtok: Some(0.5),
             cache_write_per_mtok: Some(6.25),
+            long_prompt: None,
         };
         let parts = split_cost(Some(full), cached_usage()).expect("priced");
         assert!(near(parts.uncached_input, 0.1 * 5.0), "{parts:?}");
@@ -374,6 +413,7 @@ mod tests {
         let bare = ModelPrice {
             cache_read_per_mtok: None,
             cache_write_per_mtok: None,
+            long_prompt: None,
             ..full
         };
         let parts = split_cost(Some(bare), cached_usage()).expect("priced");
@@ -407,6 +447,7 @@ mod tests {
             output_per_mtok: 30.0,
             cache_read_per_mtok: Some(0.5),
             cache_write_per_mtok: Some(6.25),
+            long_prompt: None,
         };
         let mut tracker = CostTracker::default();
         assert_eq!(tracker.parts(), None);
@@ -440,6 +481,7 @@ mod tests {
                 output_per_mtok: 6.0,
                 cache_read_per_mtok: None,
                 cache_write_per_mtok: None,
+                long_prompt: None,
             }),
             Usage {
                 input_tokens: 1_000,
@@ -449,5 +491,38 @@ mod tests {
         );
         assert_eq!(cost, Some(0.015));
         assert_eq!(calculate_cost(None, Usage::default()), None);
+    }
+
+    /// Claude Haiku 5.5 has two rate cards: $0.10 / $0.50 per million tokens for a prompt
+    /// of 100K tokens or fewer, $0.50 / $2.50 for every token of a longer one,
+    /// cache reads at a tenth of the input rate and writes at 1.25 times it.
+    #[test]
+    fn claude_haiku_5_5_charges_more_for_a_prompt_over_100k() {
+        let catalog = crate::interactive::providers::Catalog::bundled();
+        let price = catalog
+            .find("anthropic/claude-haiku-5-5")
+            .and_then(|model| model.cost.as_ref().and_then(ModelPrice::of_catalog));
+        let usage = |input_tokens| Usage {
+            input_tokens,
+            output_tokens: 10_000,
+            cache_read_tokens: 60_000,
+            cache_write_tokens: 20_000,
+        };
+        // 20K uncached, 60K read, 20K written, 10K out.
+        let short = split_cost(price, usage(100_000)).expect("priced");
+        assert!(near(short.uncached_input, 0.002), "{short:?}");
+        assert!(near(short.cache_read, 0.0006), "{short:?}");
+        assert!(near(short.cache_write, 0.0025), "{short:?}");
+        assert!(near(short.output, 0.005), "{short:?}");
+        // One token more and every token is at the long-prompt rates.
+        let long = split_cost(price, usage(100_001)).expect("priced");
+        assert!(near(long.uncached_input, 20_001.0 * 0.5 / 1e6), "{long:?}");
+        assert!(near(long.cache_read, 0.003), "{long:?}");
+        assert!(near(long.cache_write, 0.0125), "{long:?}");
+        assert!(near(long.output, 0.025), "{long:?}");
+        assert!(near(
+            long.total,
+            calculate_cost(price, usage(100_001)).expect("cost")
+        ));
     }
 }

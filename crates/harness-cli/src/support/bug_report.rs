@@ -3533,6 +3533,7 @@ mod tests {
                 output_per_mtok: 20.0,
                 cache_read_per_mtok: Some(1.0),
                 cache_write_per_mtok: Some(12.5),
+                long_prompt: None,
             })
         };
         let first = call("m", 1_000_000, 100_000, 800_000, 100_000);

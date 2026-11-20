@@ -218,6 +218,7 @@ pub fn supports_adaptive_thinking(model: &str) -> bool {
         "sonnet-4-6",
         "sonnet-4.6",
         "sonnet-5",
+        "haiku-5",
         "fable-5",
         "mythos-5",
         "mythos-preview",
@@ -325,7 +326,9 @@ impl Thinking {
 
     /// Fill an Anthropic Messages body (`pi-ai`'s `streamSimpleAnthropic`): adaptive
     /// thinking with an effort on the models that have it, a token budget - raising
-    /// `max_tokens` to make room - on the others, and nothing when thinking is off.
+    /// `max_tokens` to make room - on the others. Off is `disabled`, or the
+    /// spelling the catalog map gives `off`: Claude Sonnet 5.5 refuses
+    /// `disabled` and turns thinking off with `between_tools`.
     pub fn apply_anthropic(&self, body: &mut Value, model: &str) {
         let description = self.describe();
         let level = clamp(description, self.level);
@@ -333,7 +336,16 @@ impl Thinking {
             return;
         }
         if level == ThinkingLevel::Off {
-            body["thinking"] = json!({ "type": "disabled" });
+            let off = description
+                .and_then(|model| {
+                    model
+                        .map
+                        .iter()
+                        .find(|(candidate, _)| *candidate == ThinkingLevel::Off)
+                        .and_then(|(_, value)| *value)
+                })
+                .unwrap_or("disabled");
+            body["thinking"] = json!({ "type": off });
             return;
         }
         // Temperature is incompatible with extended thinking.
@@ -397,7 +409,7 @@ pub fn chat_format(provider_id: &str, endpoint: &str) -> ThinkingFormat {
 mod tests {
     use super::{
         ReasoningModel, Thinking, ThinkingFormat, ThinkingLevel, clamp, offered, provider_name,
-        resolve, supported_levels,
+        resolve, supported_levels, supports_adaptive_thinking,
     };
     use serde_json::json;
 
@@ -525,6 +537,80 @@ mod tests {
         .apply_anthropic(&mut body, "claude-opus-5-5");
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    /// Claude Haiku 5.5 takes adaptive thinking only: a `budget_tokens` body is
+    /// a 400, as on every Claude 5 model.
+    #[test]
+    fn claude_haiku_5_5_thinks_adaptively() {
+        let levels = &[
+            ("minimal", None),
+            ("xhigh", Some("xhigh")),
+            ("max", Some("max")),
+        ];
+        let mut body = json!({"max_tokens": 4096});
+        Thinking {
+            level: ThinkingLevel::Medium,
+            format: ThinkingFormat::Anthropic,
+            model: Some(catalog(true, levels)),
+        }
+        .apply_anthropic(&mut body, "claude-haiku-5-5");
+        assert_eq!(body["thinking"]["type"], "adaptive", "{body}");
+        assert!(body["thinking"].get("budget_tokens").is_none(), "{body}");
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["max_tokens"], 4096, "no budget folded in: {body}");
+        assert!(supports_adaptive_thinking("claude-haiku-5-5"));
+        assert!(!supports_adaptive_thinking("claude-haiku-4-5"));
+        // Off is still `disabled`: Haiku 5.5 accepts it at its default effort.
+        let mut body = json!({"max_tokens": 4096});
+        Thinking {
+            level: ThinkingLevel::Off,
+            format: ThinkingFormat::Anthropic,
+            model: Some(catalog(true, levels)),
+        }
+        .apply_anthropic(&mut body, "claude-haiku-5-5");
+        assert_eq!(
+            body,
+            json!({"max_tokens": 4096, "thinking": {"type": "disabled"}})
+        );
+    }
+
+    /// Claude Sonnet 5.5 answers `thinking: {type: "disabled"}` with a 400; its
+    /// catalog map spells off `between_tools`, sent with no other field.
+    #[test]
+    fn claude_sonnet_5_5_turns_thinking_off_between_tools() {
+        let model = catalog(
+            true,
+            &[
+                ("off", Some("between_tools")),
+                ("minimal", None),
+                ("xhigh", Some("xhigh")),
+                ("max", Some("max")),
+            ],
+        );
+        assert_eq!(supported_levels(Some(model))[0], ThinkingLevel::Off);
+        let mut body = json!({"max_tokens": 4096});
+        Thinking {
+            level: ThinkingLevel::Off,
+            format: ThinkingFormat::Anthropic,
+            model: Some(model),
+        }
+        .apply_anthropic(&mut body, "claude-sonnet-5-5");
+        assert_eq!(
+            body,
+            json!({"max_tokens": 4096, "thinking": {"type": "between_tools"}})
+        );
+        // Opus 5.5 and Fable 5.2 cannot turn it off: off runs at low effort.
+        let always_on = catalog(true, &[("off", None), ("minimal", None)]);
+        let mut body = json!({"max_tokens": 4096});
+        Thinking {
+            level: ThinkingLevel::Off,
+            format: ThinkingFormat::Anthropic,
+            model: Some(always_on),
+        }
+        .apply_anthropic(&mut body, "claude-fable-5-2");
+        assert_eq!(body["thinking"]["type"], "adaptive", "{body}");
+        assert_eq!(body["output_config"]["effort"], "low");
     }
 
     /// prime-agent reads a model's levels from its catalog entry.
