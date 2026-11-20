@@ -181,7 +181,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 75] = [
     ),
     command(
         "/memory",
-        "[queue] [list|show <id>|accept <id>...|reject <id>...]",
+        "[queue] [list|show <id>|accept <id>...|all|reject <id>...|all]",
         "Review the memory changes that wait for you; accepted ones join memory",
     ),
     command(
@@ -751,8 +751,8 @@ const MEMORY_ACTIONS: &[(&str, &str)] = &[
     ),
     ("list", "list the changes that wait for your review"),
     ("show <id>...", "one change with its evidence and diff"),
-    ("accept <id>...", "apply the changes to memory"),
-    ("reject <id>...", "keep the changes out of memory"),
+    ("accept <id>...|all", "apply the changes to memory"),
+    ("reject <id>...|all", "keep the changes out of memory"),
 ];
 
 const KNOWLEDGE_ACTIONS: &[(&str, &str)] = &[
@@ -882,10 +882,20 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
             match rest {
                 [] if words.is_empty() => choose(MEMORY_ACTIONS),
                 [] => choose(&MEMORY_ACTIONS[1..]),
-                [action, ids @ ..] if matches!(*action, "show" | "accept" | "reject") => Slot {
-                    typed_only: !ids.is_empty(),
-                    ..records(dynamic, values::MEMORY_QUEUE)
-                },
+                // `all` decides every waiting change: it stands alone.
+                [action, ids @ ..] if ids.contains(&"all") && *action != "show" => Slot::default(),
+                [action, ids @ ..] if matches!(*action, "show" | "accept" | "reject") => {
+                    // Last, so an Enter on the first row decides one change.
+                    let mut slot = records(dynamic, values::MEMORY_QUEUE);
+                    if ids.is_empty() && *action != "show" && !slot.values.is_empty() {
+                        let every = format!("every change that waits ({})", slot.values.len());
+                        slot.values.push(("all".to_owned(), every));
+                    }
+                    Slot {
+                        typed_only: !ids.is_empty(),
+                        ..slot
+                    }
+                }
                 _ => Slot::default(),
             }
         }
@@ -1373,10 +1383,27 @@ mod tests {
             ids.iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["mq-8768207a", "mq-b8db4def", "mq-1ee5ca95"],
-            "every waiting id, in the order /memory lists them"
+            ["mq-8768207a", "mq-b8db4def", "mq-1ee5ca95", "all"],
+            "every waiting id, in the order /memory lists them, then all"
         );
+        assert_eq!(ids[3].description, "every change that waits (3)");
         assert!(ids[0].description.contains("Windows listener"), "{ids:?}");
+        assert_eq!(
+            heads("/memory reject ", &dynamic)
+                .last()
+                .map(String::as_str),
+            Some("all")
+        );
+        assert!(
+            heads("/memory reject all ", &dynamic).is_empty(),
+            "all stands alone"
+        );
+        assert!(
+            !heads("/memory show ", &dynamic).contains(&"all".to_owned()),
+            "show takes ids"
+        );
+        // Nothing waits: no all to offer.
+        assert!(heads("/memory accept ", &ArgumentOptions::new()).is_empty());
         assert_eq!(
             rows("/memory queue accept mq-b8", &dynamic)[0].completion,
             "/memory queue accept mq-b8db4def"

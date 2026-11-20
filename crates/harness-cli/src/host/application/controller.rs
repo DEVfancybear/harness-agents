@@ -14270,7 +14270,8 @@ Command: \"npm run build\""
             .iter()
             .map(|item| item.label.as_str())
             .collect();
-        assert_eq!(offered, ["mq-8768207a", "mq-b8db4def"]);
+        // `all` comes last: Enter on the first row decides one change.
+        assert_eq!(offered, ["mq-8768207a", "mq-b8db4def", "all"]);
         assert_eq!(
             controller.editor.suggestions()[0].description,
             "the change mq-8768207a"
@@ -14294,7 +14295,11 @@ Command: \"npm run build\""
             .iter()
             .map(|item| item.label.as_str())
             .collect();
-        assert_eq!(offered, ["mq-b8db4def"], "the accepted change is gone");
+        assert_eq!(
+            offered,
+            ["mq-b8db4def", "all"],
+            "the accepted change is gone"
+        );
     }
 
     #[test]
