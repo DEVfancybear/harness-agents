@@ -245,7 +245,7 @@ fn ask_user_fixture() -> (
         // The test stops the fixture as soon as `ha` is done; the deadline
         // only bounds a run that never connects. A debug `ha` on a loaded
         // machine took over 20 s to send its first request.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
         let mut served = 0;
         loop {
             if stop_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline {
