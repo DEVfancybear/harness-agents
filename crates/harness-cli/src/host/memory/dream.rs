@@ -719,6 +719,78 @@ pub fn pointer(level: &str, path: &str) -> String {
     format!("(details: {level} knowledge {path})")
 }
 
+/// The statement a long entry keeps when the host moves its detail down in
+/// place of a delete: its first sentence, in its own words, at most
+/// [`DEMOTE_SUMMARY_CHARS`] characters (cut at a word, with an ellipsis, when
+/// the sentence is longer). The first line of the entry is read, a heading's
+/// or a list marker's `#`, `-` and `*` dropped; a sentence ends at `.`, `!` or
+/// `?` followed by a blank or the end of the line.
+#[must_use]
+pub fn point_of(content: &str) -> String {
+    let line = content
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['#', '-', '*']).trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut sentence = line;
+    let characters = line.char_indices().collect::<Vec<_>>();
+    for (position, (index, character)) in characters.iter().enumerate() {
+        let ends = matches!(character, '.' | '!' | '?')
+            && characters
+                .get(position + 1)
+                .is_none_or(|(_, next)| next.is_whitespace());
+        if ends {
+            sentence = &line[..index + character.len_utf8()];
+            break;
+        }
+    }
+    let flat = folded(sentence);
+    if flat.chars().count() <= DEMOTE_SUMMARY_CHARS {
+        return flat;
+    }
+    let room = DEMOTE_SUMMARY_CHARS - 1;
+    let cut = flat.chars().take(room).collect::<String>();
+    let kept = cut
+        .rsplit_once(' ')
+        .filter(|(head, _)| head.chars().count() >= room / 2)
+        .map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", kept.trim_end())
+}
+
+/// A page path for the detail of the entry `id`, in `library`: `concepts/`
+/// and the id's words joined by `-`, short enough for the pointer
+/// ([`DEMOTE_PATH_CHARS`]), and a number after it when a page is there
+/// already.
+///
+/// # Errors
+/// The first twenty paths are all taken.
+pub fn page_path_for(library: &Library, id: &str) -> Result<String, String> {
+    const PREFIX: &str = "concepts/";
+    const SUFFIX: &str = ".md";
+    let room = DEMOTE_PATH_CHARS - PREFIX.len() - SUFFIX.len() - 3;
+    let words = super::slug(id, "entry").replace('_', "-");
+    let name = words.chars().take(room).collect::<String>();
+    let name = name.trim_end_matches('-');
+    let mut store = super::super::knowledge::store::Store::new(library.root.clone());
+    if library.in_checkout {
+        store = store.self_ignoring();
+    }
+    for number in 1..=20 {
+        let path = if number == 1 {
+            format!("{PREFIX}{name}{SUFFIX}")
+        } else {
+            format!("{PREFIX}{name}-{number}{SUFFIX}")
+        };
+        if store.document(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "{} knowledge already has twenty pages named for {id}",
+        library.level
+    ))
+}
+
 /// Whitespace folded: how an entry's content is found in its page.
 fn folded(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

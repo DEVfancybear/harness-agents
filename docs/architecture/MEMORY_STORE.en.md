@@ -1477,6 +1477,29 @@ and while the page is as written; an entry changed since keeps its pointer,
 and its page stays. When the save that keeps the pointer fails, the page is
 removed.
 
+**A delete of a long entry is a demote.** A procedure, a runbook or a set of
+steps the memory holds is knowledge the user kept, and the curator's prompt says
+so: it is not an instruction to the curator, and an entry is not junk for being
+imperative or for having no transcript turn. It is never deleted for that; a
+long entry that is to leave the digest is demoted. As the prompt alone did not
+hold (`dream.sh`'s 12-step release procedure was deleted as "an operational
+instruction" on 0.9.14 and 0.9.15), the host guards it: a Deep Dream `delete`
+of an entry of 600 characters or more (`DEMOTE_MIN_CHARS`) that names no
+`merged_into` survivor is not carried out. When the pass can demote, the host
+turns it into a demote (`demote_instead_of_delete`, diagnostics `dream` /
+`delete_demoted`): the page is `concepts/<the entry's id words, joined by "-">.md`
+(at most 48 characters in all, a number after it when a page is there already),
+its title the entry's, its content the entry word for word, written by the
+same `write_page` as any demote; the entry keeps its first sentence, clipped to
+100 characters at a word (`dream::point_of`), and the pointer; the record is a
+demote whose reason says the host demoted a long entry the pass would have
+deleted, followed by what the pass said. When it cannot (the knowledge library
+is off, the entry is kept for one project and the library is the global one, the
+entry is pinned or a constraint), the delete is refused, the entry stays whole,
+and the refusal is an ordinary one in the ledger of refused edits. A merged
+delete, a short entry and a delete outside Deep Dream are unchanged. A rollback
+is the rollback of any demote.
+
 ### 17.4 `dream.md`: memory in service of a goal
 
 The automatic passes read the user's instructions for what the memory is
