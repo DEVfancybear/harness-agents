@@ -146,7 +146,13 @@ if [ "$held" = 1 ]; then
   superseded=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "superseded" and "--summary-only" in r.get("edits_summary", ""))')
   echo "   rejected: $(usage '[(r.get("kind"), r.get("reason")) for r in u.get("rejected", [])]')"
   check "the failing revision was rejected: rolled back ($rolled) or superseded by a fix ($superseded)" '[ "${rolled:-0}" -ge 1 ] || [ "${superseded:-0}" -ge 1 ]'
-  check "the revision that broke the command is not the skill now (its args do not pass --summary-only)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\""'
+  # Since 0.9.15 a skill whose revision regressed is narrowed with a condition
+  # (GUARD's paired regret, docs/architecture/SELF_IMPROVEMENT_GATE.en.md): the
+  # fix may keep the flag behind a check and run the script without it when
+  # the script does not take it. Either way the broken call is not the skill's
+  # only way any more: the flag is gone, or the skill also runs report.py
+  # without it and that revision was accepted on good uses.
+  check "the revision that broke the command is not the skill now (no --summary-only, or a fallback without it that was accepted)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\"" || { skill_text | grep -qF "[\"report.py\"]" && tr -d "" < "$D/skill-usage/revisions.jsonl" | tail -1 | grep -q "\"accepted\""; }'
   check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"))" '[ "${rolled:-0}" -ge 1 ] && [ "$(skill_text)" = "$INCUMBENT" ] && [ "$(usage "u.get(\"worked\")")" = 3 ] || [ "${superseded:-0}" -ge 1 ]'
   check "ha learning report counts how the revision was settled" '"$HA" learning report 2>&1 | tee "$RX/report.txt" | grep -qiE "[1-9][0-9]* (rolled back|accepted)"'
 fi
@@ -181,7 +187,8 @@ EOF
   before_chars=$(wc -c < "$HA_HOME/skills/$LONG/SKILL.md")
   (cd "$P" && "$HA" learning prune --skill "$LONG" --model "$MODEL" "${TH[@]}" > "$RX/prune.txt" 2>&1)
   SKILL=$LONG
-  echo "   prune attempt $attempt: $(tr -d '' < "$RX/prune.txt" | tail -2 | tr '
+  echo "   prune attempt $attempt: $(tr -d '
+' < "$RX/prune.txt" | tail -2 | tr '
 ' ' ')"
   if ledger_actions | grep -qE "edit *$"; then landed=1; break; fi
 done
