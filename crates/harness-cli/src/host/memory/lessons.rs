@@ -2662,14 +2662,20 @@ fn log_signals(
         {
             signal.log = Some(log.name.clone());
         }
-        harness_types::diag::info("learning", "log_signal")
-            .field("log", name)
+        // `log` is the log's own name; `named` is how the meditation named
+        // it, when that was otherwise (its file alone, say).
+        let mut kept = harness_types::diag::info("learning", "log_signal")
+            .field("log", log.name.as_str())
             .field("conversation", log.conversation.as_str())
             .field("lesson", id.as_str())
-            .field("action", record["action"].as_str().unwrap_or_default())
-            .emit();
+            .field("action", record["action"].as_str().unwrap_or_default());
+        if name != log.name {
+            kept = kept.field("named", name);
+        }
+        kept.emit();
         changes.push(format!(
-            "a signal from session log {name} for lesson {id}: {}",
+            "a signal from session log {} for lesson {id}: {}",
+            log.name,
             record["text"].as_str().unwrap_or_default()
         ));
     }
@@ -4691,8 +4697,19 @@ mod tests {
         let answer = json!({"signals": [
             {"log": "2026-11-06-parser.md", "lesson": "les_a", "evidence": "just answer the question, do not edit the code"}
         ]});
-        let changes = log_signals(&mut lessons, &answer, &logs, None);
+        let mut changes = Vec::new();
+        let records = harness_types::diag::capture(|| {
+            changes = log_signals(&mut lessons, &answer, &logs, None);
+        });
         assert_eq!(changes.len(), 1, "{changes:?}");
+        // The record names the log by its own name and keeps how the
+        // meditation named it.
+        let kept = records
+            .iter()
+            .find(|record| record.kind == "learning" && record.event == "log_signal")
+            .expect("learning.log_signal");
+        assert_eq!(kept.fields["log"], ".harness/sessions/2026-11-06-parser.md");
+        assert_eq!(kept.fields["named"], "2026-11-06-parser.md");
         let from_log = lessons
             .find("les_a")
             .expect("lesson")
