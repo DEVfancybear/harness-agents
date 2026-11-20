@@ -440,6 +440,10 @@ struct SideDir {
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "one signature on every platform: elsewhere there is no owner to read"
+)]
 fn owner_of(meta: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(u64::from(meta.uid()))
