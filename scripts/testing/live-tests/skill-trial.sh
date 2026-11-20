@@ -153,7 +153,12 @@ if [ "$held" = 1 ]; then
   # only way any more: the flag is gone, or the skill also runs report.py
   # without it and that revision was accepted on good uses.
   check "the revision that broke the command is not the skill now (no --summary-only, or a fallback without it that was accepted)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\"" || { skill_text | grep -qF "[\"report.py\"]" && tr -d "" < "$D/skill-usage/revisions.jsonl" | tail -1 | grep -q "\"accepted\""; }'
-  check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"))" '[ "${rolled:-0}" -ge 1 ] && [ "$(skill_text)" = "$INCUMBENT" ] && [ "$(usage "u.get(\"worked\")")" = 3 ] || [ "${superseded:-0}" -ge 1 ]'
+  # Since 0.9.15 a rejected revision keeps its good and bad uses: the failed
+  # use is counted there, against it. A later revision may land after the
+  # rollback and be accepted (the review narrows a regressed skill), so the
+  # skill's text need not be the incumbent's any more by now.
+  rolled_bad=$(usage 'max([r.get("bad") or 0 for r in u.get("rejected", []) if r.get("kind") == "rolled_back"] or [0])')
+  check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"); rolled back with $rolled_bad bad)" '{ [ "${rolled:-0}" -ge 1 ] && [ "${rolled_bad:-0}" -ge 1 ]; } || [ "${superseded:-0}" -ge 1 ]'
   check "ha learning report counts how the revision was settled" '"$HA" learning report 2>&1 | tee "$RX/report.txt" | grep -qiE "[1-9][0-9]* (rolled back|accepted)"'
 fi
 
