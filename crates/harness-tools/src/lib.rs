@@ -22,10 +22,14 @@ mod execution;
 mod find;
 #[path = "security/git_guard.rs"]
 mod git_guard;
+#[path = "processes/git_history.rs"]
+mod git_history;
 #[path = "runtime/hooks.rs"]
 mod hooks;
 #[path = "filesystem/index.rs"]
 mod index;
+#[path = "processes/location.rs"]
+mod location;
 #[path = "filesystem/lookup.rs"]
 mod lookup;
 #[path = "security/policy.rs"]
@@ -77,7 +81,8 @@ pub use codemode::{CODEMODE_TOOL, Codemode, codemode_schema};
 pub use contracts::{
     ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, EDIT_FILE_MAX_EDITS,
     ENV_REFERENCE_PREFIX, EditSpec, EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT,
-    GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
+    GIT_LOG_MAX_LIMIT, GIT_SEARCH_DEFAULT_LIMIT, GIT_SEARCH_MAX_LIMIT, GIT_SHOW_DEFAULT_BYTES,
+    GIT_SHOW_MAX_BYTES, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
     HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, HistorySearchFilter,
     IsolationMode, MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES,
     PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, READ_FILE_MAX_PATHS, TOOL_CONTRACT_VERSION,

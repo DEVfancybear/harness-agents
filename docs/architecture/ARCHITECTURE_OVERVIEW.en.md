@@ -224,6 +224,7 @@ These live in `harness-cli` as application-layer features over the services abov
 - **Session logs.** One curated log per conversation, written by the host with one model call from the journal: what was decided, learned, fixed, changed and left to do. A new conversation is told of the newest, and `/recall` reads them (`host/memory/session_log.rs`; [session continuity](SESSION_CONTINUITY.en.md)).
 - **Sleep and Deep Dream.** Every background memory pass (a conversation's review, Deep Dream's consolidation in batches, the harness evolution, the expiry) is first a job on disk under `<data>/sleep/`, tried again after a backoff and given up after so many failures (`host/memory/sleep.rs`; [Sleep](SLEEP.en.md)).
 - **Self-evaluation.** A turn that did enough is scored on five quality axes by a model call of the host's, after the verify reminder; `/self-eval` asks for it by hand, and each evaluation is one line of `evaluations.jsonl` ([self-evaluation](SELF_EVALUATION.en.md)).
+- **What the review is told before it plans again.** The memory and prompt edits the host refused are kept per scope and shown to the next planner; each learned skill is marked regressed, unsolved or mastered, and keeps the cause and expectation of its revisions as a history (`host/memory/refused.rs`, `learned.rs`; [the self-improvement gate](SELF_IMPROVEMENT_GATE.en.md)).
 - **Guards.** Command guards and secret-value redaction run in the tool dispatch in every approval mode, as compiled Rust rather than hook scripts ([guards](GUARDS.en.md)).
 - **Strategy revision and runtime layers.** A goal's turns are evaluations of its strategy; at a plateau a strategist child names other strategies. Trajectory regulation, learned rules, tool notes and the recalled learned skill shape the runtime around the model ([strategy and runtime](STRATEGY_AND_RUNTIME.en.md)).
 - **Project identity.** A project is keyed by its Git repository, so a subdirectory or a linked worktree opens the main checkout's project; a store kept under an older key is moved into place, and `ha project rekey` moves one by hand ([project identity](PROJECT_IDENTITY.en.md)).
@@ -330,6 +331,7 @@ Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `
 - [Memory store](MEMORY_STORE.en.md)
 - [Project identity](PROJECT_IDENTITY.en.md)
 - [Self-evaluation](SELF_EVALUATION.en.md)
+- [What the review is told before it plans again](SELF_IMPROVEMENT_GATE.en.md)
 - [Session continuity](SESSION_CONTINUITY.en.md)
 - [Sleep](SLEEP.en.md)
 - [Strategy revision and the runtime harness](STRATEGY_AND_RUNTIME.en.md)

@@ -777,8 +777,9 @@ async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     let schemas = coding_tool_schemas();
     // The schema set grows additively when tools are added, while the tool
     // contract version stays stable. M4/M5 added six tools; CP-B adds the
-    // write/edit/glob and ask_user tools without changing old tool digests.
-    assert_eq!(schemas.len(), 18);
+    // write/edit/glob and ask_user tools without changing old tool digests,
+    // and 0.9.15 the git_search and git_show tools.
+    assert_eq!(schemas.len(), 20);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -2024,8 +2025,9 @@ fn p3_s07_code_capabilities_reports_the_tool_contract() {
         serde_json::from_slice(&capability.stdout).expect("capabilities JSON");
     assert_eq!(capabilities["tool_contract_version"], 1);
     // M4/M5 tools and the CP-B write/edit/glob/ask_user tools are advertised
-    // additively without changing the tool contract version.
-    assert_eq!(capabilities["tool_schema_count"], 18);
+    // additively without changing the tool contract version (0.9.15 added
+    // git_search and git_show).
+    assert_eq!(capabilities["tool_schema_count"], 20);
 }
 
 #[tokio::test]

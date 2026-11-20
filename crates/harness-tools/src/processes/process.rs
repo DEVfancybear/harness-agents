@@ -26,6 +26,7 @@ use crate::{
         FinalizedCapture, ProcessSpoolConfig, Redactor, SpoolLimits, SpoolWriter, SpooledStream,
         StreamTail, finalize_capture,
     },
+    location,
     secrets::ProcessEnvironment,
 };
 
@@ -315,11 +316,13 @@ pub(crate) struct ProcessResult {
 
 /// A structured process the model asked for, in `queue` - its tool service's
 /// own - instead of the host-wide queue: it waits only for that service's
-/// other processes.
+/// other processes. It starts in `dir`, with the `PATH` an earlier shell call
+/// kept when there is one (`location`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_structured_in(
     queue: &ProcessQueue,
-    root: &Path,
+    dir: &Path,
+    path: Option<&str>,
     executable: &str,
     args: &[String],
     timeout_ms: u64,
@@ -327,33 +330,66 @@ pub(crate) async fn run_structured_in(
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
+    let host = host_with_path(&HostEnvironment::from_process(), path);
+    // A program named bare is looked up in the `PATH` an earlier shell call
+    // left, as a shell would: not found there is not started.
+    if let Some(path) = path
+        && !location::program_on_path(executable, path, dir, host.lookup("PATHEXT"))
+    {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!(
+                "{NOT_STARTED} `{executable}`: it is not on the PATH an earlier shell call set; nothing ran"
+            ),
+        ));
+    }
     run(
-        root,
+        dir,
         executable,
         args,
         timeout_ms,
         cancellation,
         environment,
         spool,
-        &HostEnvironment::from_process(),
+        &host,
         None,
         ProcessLane::Owned(queue.clone()),
     )
     .await
 }
 
-/// [`run_shell`], in `queue` instead of the host-wide queue.
+/// `host` with the `PATH` a shell call kept, when there is one.
+fn host_with_path(host: &HostEnvironment, path: Option<&str>) -> HostEnvironment {
+    match path {
+        Some(path) => host
+            .clone()
+            .with_values([("PATH".to_owned(), path.to_owned())]),
+        None => host.clone(),
+    }
+}
+
+/// [`run_shell`], in `queue` instead of the host-wide queue. It starts in `dir`
+/// with the `PATH` an earlier call kept, and with `track` it also reads where
+/// the command left the shell (`location`): what its epilogue wrote, which is
+/// nothing when the command exited itself, was killed, timed out or was
+/// canceled.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_shell_in(
     queue: &ProcessQueue,
-    root: &Path,
+    dir: &Path,
+    path: Option<&str>,
+    track: bool,
     command: &str,
     timeout_ms: u64,
     cancellation: CancellationToken,
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
-) -> Result<ProcessResult, HarnessError> {
-    run_shell_in_lane(
-        root,
+) -> Result<(ProcessResult, Option<location::End>), HarnessError> {
+    // The side file is in a directory of this user alone (`location`), not in
+    // the spool other users can reach.
+    let side_file = if track { location::side_file() } else { None };
+    let result = run_shell_in_lane(
+        dir,
         command,
         timeout_ms,
         cancellation,
@@ -361,8 +397,12 @@ pub(crate) async fn run_shell_in(
         spool,
         &HostEnvironment::from_process(),
         ProcessLane::Owned(queue.clone()),
+        path,
+        side_file.as_ref().map(location::SideFile::path),
     )
-    .await
+    .await;
+    let end = side_file.and_then(|side_file| side_file.take());
+    result.map(|result| (result, end))
 }
 
 /// The same run, against an explicit host-environment snapshot.
@@ -559,6 +599,8 @@ pub(crate) async fn run_shell_with_host(
         spool,
         host,
         ProcessLane::Exclusive,
+        None,
+        None,
     )
     .await
 }
@@ -581,6 +623,8 @@ pub(crate) async fn run_internal_shell(
         spool,
         &HostEnvironment::from_process(),
         ProcessLane::Internal,
+        None,
+        None,
     )
     .await
 }
@@ -620,7 +664,15 @@ async fn run_shell_in_lane(
     spool: &ProcessSpoolConfig,
     host: &HostEnvironment,
     lane: ProcessLane,
+    kept_path: Option<&str>,
+    side_file: Option<&Path>,
 ) -> Result<ProcessResult, HarnessError> {
+    // With a side file, the command is followed by the epilogue that writes
+    // where the shell ended (`location`).
+    let command = match side_file {
+        Some(side_file) => location::wrap(location::Shell::native(), command, side_file),
+        None => command.to_owned(),
+    };
     #[cfg(windows)]
     let (executable, shell) = windows_shell(host);
     #[cfg(windows)]
@@ -628,10 +680,21 @@ async fn run_shell_in_lane(
         "-NoProfile".to_owned(),
         "-NonInteractive".to_owned(),
         "-Command".to_owned(),
-        command.to_owned(),
+        command,
     ];
     #[cfg(not(windows))]
-    let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()]);
+    let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), command]);
+    // The shell is found in the host's own `PATH` and started by that path, so
+    // the `PATH` an earlier call left changes only what the command runs: a call
+    // that emptied it left the next one without a shell to start.
+    let name = executable.clone();
+    let executable = if kept_path.is_some() {
+        location::absolute_program(&executable, host.lookup("PATH"))
+            .map_or(executable, |path| path.to_string_lossy().into_owned())
+    } else {
+        executable
+    };
+    let host = &host_with_path(host, kept_path);
     let mut result = run(
         root,
         &executable,
@@ -645,6 +708,8 @@ async fn run_shell_in_lane(
         lane,
     )
     .await?;
+    // The receipt names the shell, not where it was found.
+    result.executable = name;
     #[cfg(windows)]
     {
         result.shell = Some(shell);
@@ -1273,7 +1338,7 @@ async fn finish_exited_group(
 /// No process exists, so there is nothing to terminate or reap and the tree is
 /// trivially clean; `queued` records whether the caller actually waited behind
 /// another call or was withdrawn before the runner took it.
-fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
+pub(crate) fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
     ProcessResult {
         executable: executable.to_owned(),
         shell: None,

@@ -146,8 +146,21 @@ if [ "$held" = 1 ]; then
   superseded=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "superseded" and "--summary-only" in r.get("edits_summary", ""))')
   echo "   rejected: $(usage '[(r.get("kind"), r.get("reason")) for r in u.get("rejected", [])]')"
   check "the failing revision was rejected: rolled back ($rolled) or superseded by a fix ($superseded)" '[ "${rolled:-0}" -ge 1 ] || [ "${superseded:-0}" -ge 1 ]'
-  check "the revision that broke the command is not the skill now (its args do not pass --summary-only)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\""'
-  check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"))" '[ "${rolled:-0}" -ge 1 ] && [ "$(skill_text)" = "$INCUMBENT" ] && [ "$(usage "u.get(\"worked\")")" = 3 ] || [ "${superseded:-0}" -ge 1 ]'
+  # Since 0.9.15 a skill whose revision regressed is narrowed with a condition
+  # (GUARD's paired regret, docs/architecture/SELF_IMPROVEMENT_GATE.en.md), so
+  # the fix the review lands takes one of several shapes: the flag gone; the
+  # flag kept behind a look at the script's own help, running report.py
+  # without it or stopping to ask when the help does not list it. What matters
+  # is that the call that broke is no longer run blindly: the flag is gone, or
+  # the skill checks first (`--help`) or falls back (`["report.py"]`), and that
+  # revision was accepted on good uses (live runs of 2026-11-20 saw all three).
+  check "the revision that broke the command is not the skill now (no --summary-only, or a checked or fallback form that was accepted)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\"" || { skill_text | grep -qE "\\[\"report.py\"\\]|--help" && tr -d "\r" < "$D/skill-usage/revisions.jsonl" | tail -1 | grep -q "\"accepted\""; }'
+  # Since 0.9.15 a rejected revision keeps its good and bad uses: the failed
+  # use is counted there, against it. A later revision may land after the
+  # rollback and be accepted (the review narrows a regressed skill), so the
+  # skill's text need not be the incumbent's any more by now.
+  rolled_bad=$(usage 'max([r.get("bad") or 0 for r in u.get("rejected", []) if r.get("kind") == "rolled_back"] or [0])')
+  check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"); rolled back with $rolled_bad bad)" '{ [ "${rolled:-0}" -ge 1 ] && [ "${rolled_bad:-0}" -ge 1 ]; } || [ "${superseded:-0}" -ge 1 ]'
   check "ha learning report counts how the revision was settled" '"$HA" learning report 2>&1 | tee "$RX/report.txt" | grep -qiE "[1-9][0-9]* (rolled back|accepted)"'
 fi
 
@@ -181,7 +194,8 @@ EOF
   before_chars=$(wc -c < "$HA_HOME/skills/$LONG/SKILL.md")
   (cd "$P" && "$HA" learning prune --skill "$LONG" --model "$MODEL" "${TH[@]}" > "$RX/prune.txt" 2>&1)
   SKILL=$LONG
-  echo "   prune attempt $attempt: $(tr -d '' < "$RX/prune.txt" | tail -2 | tr '
+  echo "   prune attempt $attempt: $(tr -d '
+' < "$RX/prune.txt" | tail -2 | tr '
 ' ' ')"
   if ledger_actions | grep -qE "edit *$"; then landed=1; break; fi
 done

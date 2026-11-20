@@ -121,6 +121,8 @@ pub mod memory_provenance;
 pub mod memory_queue;
 #[path = "memory/readout.rs"]
 pub mod memory_readout;
+#[path = "memory/refused.rs"]
+pub mod memory_refused;
 #[path = "memory/scoped.rs"]
 pub mod memory_scoped;
 #[path = "memory/search.rs"]

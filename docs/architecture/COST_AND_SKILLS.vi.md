@@ -182,12 +182,16 @@ sách dùng chung, bước repair, lịch sử).
   sửa đang chạy thử, lần dùng tính cho hoặc chống lại bản sửa đó (và một bản
   sửa thay thế bản đang hỏng thì giữ bản cũ ổn, bản hỏng được giữ dưới dạng
   `superseded`); khi không có, nó tính cho bản cũ.
-- **Bản sửa bị từ chối được giữ và hiển thị.** Mỗi skill giữ năm bản sửa gần
-  nhất bị từ chối (promoter từ chối ngay cả sau bước repair), bị rollback,
-  hoặc bị thay thế khi đang bị chấm xấu (`superseded`), kèm lý do và tóm tắt
-  ngắn các sửa đổi. Góc nhìn thư viện của refiner và curator hiển thị tối đa ba
-  dưới skill (`rejected before: rolled_back 2026-11-18: ...; tried: ...`), và
-  lịch sử ghi lý do một lần sửa skill thất bại.
+- **Các bản sửa được giữ và hiện thành một lịch sử.** Mỗi skill giữ năm bản sửa
+  gần nhất bị từ chối (promoter từ chối ngay cả sau bước repair), bị rollback,
+  hoặc bị thay thế khi đang bị chấm xấu (`superseded`) và năm bản được chấp nhận
+  gần nhất, mỗi bản kèm nguyên nhân nó nhắm tới, điều nó kỳ vọng và các lần dùng
+  được chấm mà nó nhận (planner được yêu cầu `cause` và `expect`; xem [cổng tự cải
+  thiện](SELF_IMPROVEMENT_GATE.vi.md)). Góc nhìn thư viện của refiner và curator
+  hiển thị ba bản cuối, cũ nhất trước, dưới skill (`revised 2026-11-18
+  (rolled_back): cause: ...; expected: ...; observed: 0 good, 2 bad; why not
+  kept: ...; tried: ...`), cùng standing của skill (`regressed`, `unsolved`,
+  `mastered`), và lịch sử ghi lý do một lần sửa skill thất bại.
 - **`ha learning report`** đếm, trong 30 ngày, số bản sửa, số đang chạy thử,
   được nhận, bị rollback và bị từ chối (từ
   `<data>/skill-usage/revisions.jsonl`).
@@ -235,6 +239,11 @@ luật chi phí của trial prune, `cost_stats`), `refine.rs` (`prune`,
   PROVIDER/MODEL] [--thinking LEVEL]` chạy ngay (bất kể `HA_SKILL_PRUNE`; không
   chạy khi learned skill bị tắt). Diagnostics: `skill prune` với số ứng viên,
   số áp được và số bị từ chối.
+- **Skill mastered cũng được cắt gọn.** Skill được đánh dấu `mastered` (xem [cổng
+  tự cải thiện](SELF_IMPROVEMENT_GATE.vi.md)) là ứng viên thường gặp. Quy tắc
+  "chỉ thêm" nói về các bản sửa làm đổi điều skill làm; prompt của prune nói rằng
+  prune được rút gọn câu chữ và bỏ những gì không dòng "worked before" nào của
+  skill dựa vào, giữ mọi bước mà các dòng đó dựa vào, và không thêm quy tắc.
 
 ## 6. Judge hindsight chấm từng bước (P4)
 
@@ -316,6 +325,7 @@ và kết quả của một turn, đọc từ journal), được nối trong
   theo của skill đã sửa thay cho nó, và thay "tốt hơn hẳn trên tập đó" bằng
   "hai lần dùng được chấm tốt nhiều hơn xấu".
 - **Teacher của P4**: ha không huấn luyện model.
+- **Việc kiểm một bản sửa với điều đã chạy tốt trước khi nó được áp dụng (GUARD)**: người bảo trì chọn không lấy; đợt chạy thử kèm rollback thay vào chỗ đó ([cổng tự cải thiện](SELF_IMPROVEMENT_GATE.vi.md), mục 5).
 
 ## 9. Test
 

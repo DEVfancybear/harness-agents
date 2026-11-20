@@ -432,6 +432,23 @@ fn file_lists(
     };
     // Resolved once: every argument is compared with it.
     let root = root.and_then(|root| root.canonicalize().ok());
+    // The folder each shell or process call ran in, when its result says it
+    // was not the root: its relative words are looked up from there.
+    let shell_calls = messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .filter(|call| is_shell_call(&call.name))
+        .map(|call| call.call_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let ran_in = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .filter_map(|message| {
+            let id = message.tool_call_id.as_deref()?;
+            let dir = shell_dir(&message.content)?;
+            shell_calls.contains(id).then_some((id, dir))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let cells = messages
         .iter()
         .flat_map(|message| &message.tool_calls)
@@ -478,7 +495,10 @@ fn file_lists(
                 }
                 "run_shell" | "run_process" | "bash" | "shell" => {
                     if let Some(root) = root.as_deref() {
-                        let (named, redirected) = shell_files(&arguments, root);
+                        let dir = ran_in
+                            .get(call.call_id.as_str())
+                            .map_or_else(|| root.to_path_buf(), |dir| root.join(dir));
+                        let (named, redirected) = shell_files(&arguments, root, &dir);
                         for path in named {
                             touch(&mut read, path);
                         }
@@ -506,6 +526,31 @@ const FILE_LIST_MAX: usize = 200;
 /// Whether a call is the Python REPL's, under its name or the ones it had.
 fn is_repl_call(name: &str) -> bool {
     matches!(name, "python_repl" | "ipython" | "python")
+}
+
+/// Whether a call runs a shell command or a program.
+fn is_shell_call(name: &str) -> bool {
+    matches!(name, "run_shell" | "run_process" | "bash" | "shell")
+}
+
+/// The line a shell or process call's result holds, as one of the host's notes:
+/// the folder the call ran in, relative to the workspace and `/` separated (`.`
+/// for the root itself, so the line is always there while the location is kept,
+/// and the last one is the host's, never a line the command printed). The host
+/// writes it (`harness-tools`' shell location); a summary's file lists read it
+/// back from the result, which is all a conversation keeps of a call.
+pub const SHELL_DIR_PREFIX: &str = "ran in ";
+
+/// The folder [`SHELL_DIR_PREFIX`]'s line of a shell result names: the last
+/// such line, since the host's notes follow the command's own output, which
+/// may print a line that starts the same way.
+fn shell_dir(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(SHELL_DIR_PREFIX))
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
 }
 
 /// The line a Python cell's result starts with when the cell opened files of
@@ -566,10 +611,16 @@ const SHELL_WORDS_MAX: usize = 64;
 
 /// The workspace files a shell or process call names: `command`'s words
 /// ([`shell_words`]), `executable` and each of `args`. A word that resolves to
-/// an existing file inside `root` was read, unless it follows a `>` or `>>`,
 /// which changed it. No command is recognised by name: a path to a file of
+/// the workspace is what the call worked on, whatever ran it. A relative word
+/// is read from `dir`, the folder the call ran in (the root, unless its result
+/// says otherwise: [`SHELL_DIR_PREFIX`]).
 /// the workspace is what the call worked on, whatever ran it.
-fn shell_files(arguments: &Value, root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+fn shell_files(
+    arguments: &Value,
+    root: &std::path::Path,
+    dir: &std::path::Path,
+) -> (Vec<String>, Vec<String>) {
     let mut words = arguments
         .get("command")
         .and_then(Value::as_str)
@@ -592,7 +643,7 @@ fn shell_files(arguments: &Value, root: &std::path::Path) -> (Vec<String>, Vec<S
     );
     let (mut read, mut changed) = (Vec::new(), Vec::new());
     for (word, redirected) in words.into_iter().take(SHELL_WORDS_MAX) {
-        let Some(path) = workspace_file(root, &word) else {
+        let Some(path) = workspace_file(root, dir, &word) else {
             continue;
         };
         let list = if redirected { &mut changed } else { &mut read };
@@ -654,9 +705,10 @@ fn shell_words(command: &str) -> Vec<(String, bool)> {
     words
 }
 
-/// `word` as a path relative to `root` (already canonical), with `/`
-/// separators, when it names an existing file inside it.
-fn workspace_file(root: &std::path::Path, word: &str) -> Option<String> {
+/// `word`, read from `dir` (where the call ran, inside `root`), as a path
+/// relative to `root` (already canonical), with `/` separators, when it names an
+/// existing file inside it.
+fn workspace_file(root: &std::path::Path, dir: &std::path::Path, word: &str) -> Option<String> {
     let word = word.trim();
     // A flag, a glob or a URL is not one file.
     if word.is_empty()
@@ -671,7 +723,7 @@ fn workspace_file(root: &std::path::Path, word: &str) -> Option<String> {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        root.join(path)
+        dir.join(path)
     };
     if !candidate.is_file() {
         return None;
@@ -8123,6 +8175,64 @@ mod compaction_cut_tests {
         // A shortened result keeps the paths it still holds whole.
         let fitted = super::fitted_result(&format!("python_repl:\n{note}"));
         assert_eq!(super::cell_files(&fitted).0, vec!["cell.txt".to_owned()]);
+    }
+
+    /// A shell call that ran in a folder of the workspace (its result says
+    /// so) names its files from that folder: `spec.txt` was `notes/spec.txt`.
+    /// It was looked up from the root, where it is no file, and not listed.
+    #[test]
+    fn a_shell_call_names_its_files_from_the_folder_it_ran_in() {
+        let temp = std::env::temp_dir().join(format!(
+            "ha-runtime-ran-in-{}-{}",
+            std::process::id(),
+            super::SessionId::generate().as_str()
+        ));
+        let root = temp.join("work");
+        std::fs::create_dir_all(root.join("notes")).expect("notes");
+        std::fs::write(root.join("notes").join("spec.txt"), "spec").expect("spec");
+        let shell = serde_json::json!({"command": "type spec.txt > made.txt"}).to_string();
+        let mut messages = vec![calls(&[("run_shell", shell.as_str())])];
+        assert!(file_lists(&messages, None, Some(&root)).0.is_empty());
+        messages.push(ProviderMessage::tool_result(
+            "call-0".to_owned(),
+            format!("process exit=0\n{}notes", super::SHELL_DIR_PREFIX),
+        ));
+        let (read, _) = file_lists(&messages, None, Some(&root));
+        assert_eq!(read, vec!["notes/spec.txt".to_owned()]);
+        // A folder that leaves the workspace names nothing.
+        messages[1] = ProviderMessage::tool_result(
+            "call-0".to_owned(),
+            format!("process exit=0\n{}..", super::SHELL_DIR_PREFIX),
+        );
+        assert!(file_lists(&messages, None, Some(&root)).0.is_empty());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A call that ran at the root has the host's line too (`ran in .`), and it
+    /// comes last: a line of the command's own output that starts the same way
+    /// (`ran in 0.4s`) is not taken for the folder.
+    #[test]
+    fn a_line_the_command_printed_is_not_taken_for_the_folder_it_ran_in() {
+        let temp = std::env::temp_dir().join(format!(
+            "ha-runtime-ran-at-root-{}-{}",
+            std::process::id(),
+            super::SessionId::generate().as_str()
+        ));
+        let root = temp.join("work");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("spec2.txt"), "spec").expect("spec");
+        let shell = serde_json::json!({"command": "cat spec2.txt; echo ran in 0.4s"}).to_string();
+        let mut messages = vec![calls(&[("run_shell", shell.as_str())])];
+        messages.push(ProviderMessage::tool_result(
+            "call-0".to_owned(),
+            format!(
+                "process exit=0\nstdout:\nspec\n{p}0.4s\n\n{p}.",
+                p = super::SHELL_DIR_PREFIX
+            ),
+        ));
+        let (read, _) = file_lists(&messages, None, Some(&root));
+        assert_eq!(read, vec!["spec2.txt".to_owned()]);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     fn conversation(turns: usize) -> Vec<ProviderMessage> {

@@ -304,6 +304,16 @@ impl ToolPolicy {
     /// before this method or any approval UI.
     #[must_use]
     pub fn decide(&self, action: &CodingToolAction) -> Decision {
+        self.decide_with(action, false)
+    }
+
+    /// [`Self::decide`], when `path_kept` says the command would run with a
+    /// `PATH` an earlier shell call changed: an allow rule does not decide a
+    /// shell or process call then (it was written, or agreed to, for the host's
+    /// `PATH`, where `git` and `python` are what the user knows), so the mode does:
+    /// full-auto allows, the others ask. Deny rules still apply.
+    #[must_use]
+    pub fn decide_with(&self, action: &CodingToolAction, path_kept: bool) -> Decision {
         if self.turn_rules.snapshot().is_none() {
             return Decision::Deny(
                 "tool permission rules are unavailable; refusing the action".to_owned(),
@@ -324,8 +334,14 @@ impl ToolPolicy {
                 rule.reason.clone()
             });
         }
+        let command = matches!(
+            action,
+            CodingToolAction::RunShell { .. } | CodingToolAction::RunProcess { .. }
+        );
         if let Some(rule) = tool_rules.iter().find(|rule| {
-            rule.effect == PolicyEffect::Allow && pattern_matches(&rule.pattern, &target)
+            rule.effect == PolicyEffect::Allow
+                && !(path_kept && command)
+                && pattern_matches(&rule.pattern, &target)
         }) {
             return Decision::Allow {
                 reason: format!("rule {}", rule.pattern),
@@ -531,6 +547,8 @@ impl ToolPolicy {
                 | CodingToolAction::FindFiles { .. }
                 | CodingToolAction::GitDiff { .. }
                 | CodingToolAction::GitLog { .. }
+                | CodingToolAction::GitSearch { .. }
+                | CodingToolAction::GitShow { .. }
                 | CodingToolAction::GitStatus
         );
         let path = action
@@ -677,6 +695,8 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
         | CodingToolAction::FindFiles { path, .. }
         | CodingToolAction::GitDiff { path }
         | CodingToolAction::GitLog { path, .. }
+        | CodingToolAction::GitSearch { path, .. }
+        | CodingToolAction::GitShow { path, .. }
             if path.as_deref().is_some_and(|value| value.trim().is_empty()) =>
         {
             Err(HarnessError::new(
@@ -684,9 +704,15 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
                 "optional tool path must not be blank",
             ))
         }
-        CodingToolAction::SearchText { query, .. } if query.trim().is_empty() => Err(
-            HarnessError::new(ErrorCode::InvalidPayload, "search query must not be empty"),
-        ),
+        CodingToolAction::SearchText { query, .. } | CodingToolAction::GitSearch { query, .. }
+            if query.trim().is_empty() =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "search query must not be empty",
+            ))
+        }
+        CodingToolAction::GitShow { commit, .. } => crate::git_history::check_revision(commit),
         CodingToolAction::Glob { pattern, .. } if pattern.trim().is_empty() => Err(
             HarnessError::new(ErrorCode::InvalidPayload, "glob pattern must not be empty"),
         ),
@@ -1094,6 +1120,53 @@ mod g05_policy_tests {
             "the turn's own rules are still cleared"
         );
         assert_ne!(earlier.revision(), before);
+    }
+
+    /// A rule that allows `run_shell(cargo test *)` was agreed to for the host's
+    /// `PATH`. While an earlier shell call has changed it, the rule does not
+    /// decide: the call asks (full-auto still allows; a deny rule still denies;
+    /// a call that is not a command is not affected).
+    #[test]
+    fn an_allow_rule_does_not_decide_a_command_while_the_path_is_changed() {
+        let rule = ToolPatternRule::allow("run_shell(cargo test *)", "agreed");
+        let shell = CodingToolAction::RunShell {
+            command: "cargo test -q".to_owned(),
+            timeout_ms: 5_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        };
+        let policy = ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![rule.clone()]);
+        assert!(matches!(policy.decide(&shell), Decision::Allow { .. }));
+        assert!(matches!(
+            policy.decide_with(&shell, false),
+            Decision::Allow { .. }
+        ));
+        assert_eq!(policy.decide_with(&shell, true), Decision::Ask);
+        let full = ToolPolicy::new(1, Vec::new())
+            .with_tool_rules(vec![rule])
+            .with_mode(PolicyMode::FullAuto);
+        assert!(matches!(
+            full.decide_with(&shell, true),
+            Decision::Allow { .. }
+        ));
+        let denied = ToolPolicy::new(1, Vec::new())
+            .with_tool_rules(vec![ToolPatternRule::deny("run_shell(cargo *)", "no")]);
+        assert!(matches!(
+            denied.decide_with(&shell, true),
+            Decision::Deny(_)
+        ));
+        let read = CodingToolAction::ReadFile {
+            path: "a.txt".to_owned(),
+            offset: None,
+            limit: None,
+            tail: None,
+        };
+        let reads = ToolPolicy::new(1, Vec::new())
+            .with_tool_rules(vec![ToolPatternRule::allow("read_file(a.txt)", "ok")]);
+        assert!(matches!(
+            reads.decide_with(&read, true),
+            Decision::Allow { .. }
+        ));
     }
 
     #[test]

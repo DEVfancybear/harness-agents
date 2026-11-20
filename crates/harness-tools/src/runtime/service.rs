@@ -300,17 +300,23 @@ pub struct ToolExecutionService {
     /// The queue this service's model processes wait in: one at a time
     /// within the service, beside other agents' (`ProcessLane::Owned`).
     process_queue: process::ProcessQueue,
+    /// Where each conversation's shell calls left off (`location`).
+    places: Arc<crate::location::Places>,
 }
 
 /// A host's own check before a command runs, after the policy allowed it:
 /// `Some(reason)` refuses the command with that reason, which the model reads;
 /// `None` lets it run. It can only narrow what the policy allowed, and a guard
 /// that cannot answer says `None`, so the command runs as without a guard.
+///
+/// `working_dir` is where the command starts: the workspace root, or the
+/// directory an earlier shell call of the conversation left off in.
 pub trait ToolGuard: Send + Sync {
     fn check<'a>(
         &'a self,
         action: &'a CodingToolAction,
         workspace_root: &'a str,
+        working_dir: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
 }
 
@@ -331,7 +337,17 @@ impl ToolExecutionService {
             elsewhere: None,
             guard: None,
             process_queue: process::ProcessQueue::default(),
+            places: Arc::default(),
         }
+    }
+
+    /// Whether a shell call starts where the conversation's last one left off
+    /// (`HA_SHELL_KEEP_LOCATION`; on unless that says `off`). A service made
+    /// with `false` starts every call at the workspace root.
+    #[must_use]
+    pub fn with_shell_location_kept(mut self, kept: bool) -> Self {
+        self.places = Arc::new(crate::location::Places::new(kept));
+        self
     }
 
     /// Show `read_file` and `search_text` lines with their hashline anchors
@@ -377,9 +393,64 @@ impl ToolExecutionService {
         ) {
             return None;
         }
+        // Judged from where the conversation's shell is now. That is read
+        // outside its lock: the lock cannot be held from here to the dispatch
+        // (the guard is a model call, and the call then waits for an approval),
+        // so the dispatch looks at the place again under the lock and judges
+        // the call a second time when it is no longer the one judged here
+        // ([`Self::rejudge`]).
+        let place = self
+            .places
+            .start(prepared.request.task_id.as_str(), &prepared.workspace_root);
+        let working_dir = working_dir_text(prepared, &place);
+        self.places
+            .judged(prepared.request.invocation_id.as_str(), &working_dir);
         tokio::select! {
-            refusal = guard.check(&prepared.final_action, &prepared.workspace_root_text) => refusal,
+            refusal = guard.check(&prepared.final_action, &prepared.workspace_root_text, &working_dir) => refusal,
             () = cancellation.cancelled() => None,
+        }
+    }
+
+    /// The guard's refusal of a command that is about to run in `place`, read
+    /// under the conversation's lock, when the guard judged it from another
+    /// directory: a call of the conversation ran between the check and now and
+    /// moved the shell, and a path the command names would be read from the old
+    /// directory. Judging it again, from the right one, is the one answer that
+    /// is correct (the command is neither run on a stale verdict nor refused
+    /// for a change it did not make) and needs no lock held across the guard's
+    /// model call and the approval. A call the guard never judged (no guard)
+    /// has nothing to compare.
+    async fn rejudge(
+        &self,
+        prepared: &PreparedToolRequest,
+        place: &crate::location::Place,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let guard = self.guard.as_ref()?;
+        let judged = self
+            .places
+            .take_judged(prepared.request.invocation_id.as_str())?;
+        let working_dir = working_dir_text(prepared, place);
+        if judged == working_dir {
+            return None;
+        }
+        tokio::select! {
+            refusal = guard.check(&prepared.final_action, &prepared.workspace_root_text, &working_dir) => refusal,
+            () = cancellation.cancelled() => None,
+        }
+    }
+
+    /// The notes a shell or process call left for its result, as one block of
+    /// short lines: where it ran when that was not the root, and where the
+    /// next one starts.
+    pub(crate) fn location_notes(&self, execution_id: Option<&ToolExecutionId>) -> Vec<String> {
+        let notes = execution_id
+            .map(|id| self.places.take_notes(id.as_str()))
+            .unwrap_or_default();
+        if notes.is_empty() {
+            Vec::new()
+        } else {
+            vec![notes.join("\n")]
         }
     }
 
@@ -539,8 +610,44 @@ impl ToolExecutionService {
         if let Some(reason) = &prepared.policy_denial {
             Decision::Deny(reason.clone())
         } else {
-            self.policy.decide(prepared.action())
+            // A rule that allowed a command allowed it with the `PATH` it was
+            // written for: while a shell call has changed it, the rule does not
+            // decide (full-auto and a person's answer still do).
+            self.policy
+                .decide_with(prepared.action(), self.shell_place(prepared).path.is_some())
         }
+    }
+
+    /// Where a shell or process call of `prepared` starts now: the root with the
+    /// host's `PATH`, or where an earlier shell call of the conversation left it.
+    pub(crate) fn shell_place(&self, prepared: &PreparedToolRequest) -> crate::location::Place {
+        if !matches!(
+            prepared.final_action,
+            CodingToolAction::RunShell { .. } | CodingToolAction::RunProcess { .. }
+        ) {
+            return crate::location::Place::default();
+        }
+        self.places
+            .start(prepared.request.task_id.as_str(), &prepared.workspace_root)
+    }
+
+    /// What the person who approves the call is told about where it starts,
+    /// when that is not the root with the host's `PATH`.
+    #[must_use]
+    pub fn location_summary(&self, prepared: &PreparedToolRequest) -> Option<String> {
+        self.shell_place(prepared).summary(&prepared.workspace_root)
+    }
+
+    /// The call ended without reaching a shell (refused, blocked, failed first):
+    /// what the command guard judged for it is dropped.
+    pub fn forget_guard_verdict(&self, invocation: &harness_types::ToolInvocationId) {
+        self.places.forget_judged(invocation.as_str());
+    }
+
+    /// How many command-guard verdicts are kept for calls not yet dispatched.
+    #[cfg(test)]
+    pub(crate) fn guard_verdicts_kept(&self) -> usize {
+        self.places.judged_len()
     }
 
     /// Replace how `secret://` references are resolved for this host.
@@ -770,7 +877,8 @@ impl ToolExecutionService {
             ));
         }
         let approval_id = harness_types::ToolApprovalId::generate();
-        let binding_json = json!({
+        let shell_place = self.shell_place(prepared).binding();
+        let mut binding_json = json!({
             "schema_version": TOOL_CONTRACT_VERSION,
             "approval_id": approval_id,
             "session_id": prepared.request.session_id,
@@ -785,6 +893,9 @@ impl ToolExecutionService {
             "tool_revision": TOOL_CONTRACT_VERSION,
             "expires_at_unix_ms": expires_at_unix_ms,
         });
+        if !shell_place.is_empty() {
+            binding_json["shell_place"] = json!(shell_place);
+        }
         let binding_hash = ContentHash::from_canonical_json(&binding_json)?;
         let grant = ApprovalGrant {
             approval_id: approval_id.clone(),
@@ -799,6 +910,7 @@ impl ToolExecutionService {
             policy_revision: prepared.policy_revision,
             tool_revision: u64::from(TOOL_CONTRACT_VERSION),
             expires_at_unix_ms,
+            shell_place,
         };
         self.store
             .issue_tool_approval(ToolApprovalRecord {
@@ -942,7 +1054,8 @@ impl ToolExecutionService {
                 )
                 .await;
         };
-        if let Some((code, reason)) = approval_mismatch(&prepared, &approval) {
+        let shell_place = self.shell_place(&prepared).binding();
+        if let Some((code, reason)) = approval_mismatch(&prepared, &approval, &shell_place) {
             return self
                 .record_denied_begun(&prepared, execution_id, Some(&approval), code, &reason)
                 .await;
@@ -1359,7 +1472,9 @@ impl ToolExecutionService {
             | CodingToolAction::SearchText { path, .. }
             | CodingToolAction::FindFiles { path, .. }
             | CodingToolAction::GitDiff { path }
-            | CodingToolAction::GitLog { path, .. } => {
+            | CodingToolAction::GitLog { path, .. }
+            | CodingToolAction::GitSearch { path, .. }
+            | CodingToolAction::GitShow { path, .. } => {
                 if let Some(path) = path {
                     let _ = resolve_relative(root, path, true)?;
                 }
@@ -1933,9 +2048,43 @@ impl ToolExecutionService {
                 isolation,
                 ..
             } => {
+                // Where an earlier shell call of this conversation left off.
+                // The conversation's turn: from reading where it starts to storing
+                // where the last call ended, no other call of it does either.
+                let (serial, waited) = match self
+                    .places
+                    .take_turn(prepared.request.task_id.as_str(), &cancellation)
+                    .await
+                {
+                    crate::location::Turn::Held(serial, waited) => (serial, waited),
+                    crate::location::Turn::Canceled => {
+                        let lease = self
+                            .begin_backend_lease(
+                                prepared,
+                                action,
+                                *timeout_ms,
+                                *isolation,
+                                execution_id,
+                            )
+                            .await?;
+                        let withdrawn = process::canceled_before_spawn(executable, true);
+                        return self.finish_backend_lease(root, lease, Ok(withdrawn)).await;
+                    }
+                };
+                let place = self.places.start(prepared.request.task_id.as_str(), root);
+                let dir = place.dir.clone().unwrap_or_else(|| root.to_owned());
+                // The guard judged this call from where the shell was; if a call
+                // of the conversation moved it since, it is judged again.
+                if let Some(reason) = self.rejudge(prepared, &place, &cancellation).await {
+                    return Ok(Dispatched::plain(ToolOutput::Denied {
+                        code: ErrorCode::PolicyDenied.as_str().to_owned(),
+                        reason,
+                    }));
+                }
                 // The same guards as a shell command: a program can be a shell.
                 if let Some(refusal) = crate::command_guard::process_refusal(
                     root,
+                    &dir,
                     executable,
                     args,
                     &[],
@@ -1954,7 +2103,8 @@ impl ToolExecutionService {
                     .await?;
                 let output = process::run_structured_in(
                     &self.process_queue,
-                    root,
+                    &dir,
+                    place.path.as_deref(),
                     executable,
                     args,
                     *timeout_ms,
@@ -1962,7 +2112,20 @@ impl ToolExecutionService {
                     environment,
                     &self.spool,
                 )
-                .await;
+                .await
+                .map(|mut result| {
+                    result.queued |= waited;
+                    result
+                });
+                self.places.finish(
+                    prepared.request.task_id.as_str(),
+                    execution_id.as_str(),
+                    root,
+                    &place,
+                    None,
+                    None,
+                );
+                drop(serial);
                 self.finish_backend_lease(root, lease, output).await
             }
             CodingToolAction::RunShell {
@@ -1971,11 +2134,46 @@ impl ToolExecutionService {
                 isolation,
                 ..
             } => {
+                // Where an earlier shell call of this conversation left off:
+                // the command's relative paths are read from there.
+                // The conversation's turn: from reading where it starts to storing
+                // where it ended, no other call of it does either.
+                let (serial, waited) = match self
+                    .places
+                    .take_turn(prepared.request.task_id.as_str(), &cancellation)
+                    .await
+                {
+                    crate::location::Turn::Held(serial, waited) => (serial, waited),
+                    crate::location::Turn::Canceled => {
+                        let lease = self
+                            .begin_backend_lease(
+                                prepared,
+                                action,
+                                *timeout_ms,
+                                *isolation,
+                                execution_id,
+                            )
+                            .await?;
+                        let withdrawn = process::canceled_before_spawn("shell", true);
+                        return self.finish_backend_lease(root, lease, Ok(withdrawn)).await;
+                    }
+                };
+                let place = self.places.start(prepared.request.task_id.as_str(), root);
+                let dir = place.dir.clone().unwrap_or_else(|| root.to_owned());
+                // The guard judged this call from where the shell was; if a call
+                // of the conversation moved it since, it is judged again.
+                if let Some(reason) = self.rejudge(prepared, &place, &cancellation).await {
+                    return Ok(Dispatched::plain(ToolOutput::Denied {
+                        code: ErrorCode::PolicyDenied.as_str().to_owned(),
+                        reason,
+                    }));
+                }
                 // What a command must never do in any mode: delete what cannot
                 // be had back, kill by name, search a whole drive, touch a
                 // secret file or what judges the agent (`command_guard`).
                 if let Some(refusal) = crate::command_guard::shell_refusal(
                     root,
+                    &dir,
                     command,
                     &[],
                     cancellation.clone(),
@@ -1991,7 +2189,7 @@ impl ToolExecutionService {
                 // prime-agent's dirty-tree guard: a git discard that would
                 // throw away uncommitted work is refused before it runs.
                 if let Some(reason) =
-                    crate::git_guard::refusal(root, command, cancellation.clone(), &self.spool)
+                    crate::git_guard::refusal(&dir, command, cancellation.clone(), &self.spool)
                         .await
                 {
                     return Ok(Dispatched::plain(ToolOutput::Denied {
@@ -2004,7 +2202,9 @@ impl ToolExecutionService {
                     .await?;
                 let output = process::run_shell_in(
                     &self.process_queue,
-                    root,
+                    &dir,
+                    place.path.as_deref(),
+                    self.places.enabled(),
                     command,
                     *timeout_ms,
                     cancellation,
@@ -2012,6 +2212,25 @@ impl ToolExecutionService {
                     &self.spool,
                 )
                 .await;
+                // Where the shell ended counts only when the command ran to its
+                // end: a timeout or a cancel left it wherever it was killed.
+                let (output, end) = match output {
+                    Ok((mut result, end)) => {
+                        result.queued |= waited;
+                        let end = end.filter(|_| !result.timed_out && !result.canceled);
+                        (Ok(result), end)
+                    }
+                    Err(error) => (Err(error), None),
+                };
+                self.places.finish(
+                    prepared.request.task_id.as_str(),
+                    execution_id.as_str(),
+                    root,
+                    &place,
+                    end.as_ref(),
+                    process::HostEnvironment::from_process().lookup("PATH"),
+                );
+                drop(serial);
                 self.finish_backend_lease(root, lease, output).await
             }
             CodingToolAction::GitStatus => {
@@ -2048,6 +2267,34 @@ impl ToolExecutionService {
                         .await?;
                 Ok(Dispatched::plain(git_output("log", output)))
             }
+            CodingToolAction::GitSearch { query, path, limit } => Ok(Dispatched::plain(
+                crate::git_history::search(
+                    root,
+                    query,
+                    path.as_deref(),
+                    *limit,
+                    cancellation,
+                    &self.spool,
+                )
+                .await?,
+            )),
+            CodingToolAction::GitShow {
+                commit,
+                path,
+                offset,
+                length,
+            } => Ok(Dispatched::plain(
+                crate::git_history::show(
+                    root,
+                    commit,
+                    path.as_deref(),
+                    *offset,
+                    *length,
+                    cancellation,
+                    &self.spool,
+                )
+                .await?,
+            )),
             CodingToolAction::TaskUpdate { .. } => Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
                 "task update must use its atomic task projection path",
@@ -2919,6 +3166,7 @@ fn binding_from_grant(grant: &ApprovalGrant) -> ToolApprovalBinding {
 fn approval_mismatch(
     prepared: &PreparedToolRequest,
     approval: &ApprovalGrant,
+    shell_place: &str,
 ) -> Option<(ErrorCode, String)> {
     if approval.actor_id != prepared.request.actor_id
         || approval.session_id != prepared.request.session_id
@@ -2930,6 +3178,7 @@ fn approval_mismatch(
         || approval.workspace_fingerprint != prepared.workspace_fingerprint
         || approval.policy_revision != prepared.policy_revision
         || approval.tool_revision != u64::from(TOOL_CONTRACT_VERSION)
+        || approval.shell_place != shell_place
     {
         return Some((
             ErrorCode::ApprovalStale,
@@ -2943,6 +3192,15 @@ fn approval_mismatch(
         return Some((ErrorCode::ApprovalStale, "approval has expired".to_owned()));
     }
     None
+}
+
+/// Where a command of `prepared` starts, as the command guard is told: the
+/// directory of the conversation's place, or the workspace root.
+fn working_dir_text(prepared: &PreparedToolRequest, place: &crate::location::Place) -> String {
+    place.dir.as_ref().map_or_else(
+        || prepared.workspace_root_text.clone(),
+        |dir| dir.to_string_lossy().into_owned(),
+    )
 }
 
 fn action_requests_strict_isolation(action: &CodingToolAction) -> bool {
@@ -3068,7 +3326,7 @@ fn git_log_arguments(path: Option<&str>, limit: Option<u32>) -> Vec<String> {
     args
 }
 
-fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
+pub(crate) fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
     // A new project is often a folder with no repository yet. Git answers
     // `diff` there with its whole usage text (6 KB the model reads for
     // nothing) and the others with a fatal line; one sentence says it.
@@ -3400,6 +3658,423 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp);
     }
 
+    /// Two shell calls of one conversation, started together: the first goes
+    /// into `sub`, the second prints where it is. Each call used to read its
+    /// start place before it held the process permit, so the second, started
+    /// from the root, could store the root over the place the first had left. Now
+    /// the second starts at the root before the first ran, or in `sub` after it,
+    /// and a third call, after both, is in `sub` either way.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn two_concurrent_calls_of_one_conversation_never_see_a_torn_place() {
+        let (enter, show) = if cfg!(windows) {
+            (
+                "Start-Sleep -Milliseconds 300; Set-Location sub",
+                "(Get-Location).Path",
+            )
+        } else {
+            ("sleep 0.3; cd sub", "pwd")
+        };
+        for _ in 0..3 {
+            let temp = std::env::temp_dir().join(format!(
+                "harness-tools-places-{}",
+                harness_types::InputId::generate()
+            ));
+            let workspace = temp.join("workspace");
+            std::fs::create_dir_all(workspace.join("sub")).expect("sub");
+            let store = Arc::new(
+                SqliteStore::open_writer(WriterOpenOptions::new(
+                    temp.join("data"),
+                    HostId::generate(),
+                ))
+                .await
+                .expect("store opens"),
+            );
+            let service = ToolExecutionService::new(Arc::clone(&store))
+                .with_policy(ToolPolicy::default().with_mode(PolicyMode::FullAuto));
+            let (session, task) = (SessionId::generate(), TaskId::generate());
+            harness_session::SessionService::new(Arc::clone(&store))
+                .admit_input(harness_session::AdmitInputRequest {
+                    session_id: session.clone(),
+                    task_id: task.clone(),
+                    input_id: InputId::generate(),
+                    expected_sequence: 1,
+                    authority: harness_types::SourceAuthority::User,
+                    raw_text: "go".to_owned(),
+                    workspace: observe_workspace(ProjectId::generate(), &workspace)
+                        .expect("observation"),
+                    initial_plan_items: Vec::new(),
+                })
+                .await
+                .expect("input admitted");
+            let call = |command: &str| {
+                ToolRequest::new(
+                    session.clone(),
+                    task.clone(),
+                    "test.actor",
+                    workspace.clone(),
+                    CodingToolAction::RunShell {
+                        command: command.to_owned(),
+                        timeout_ms: 60_000,
+                        isolation: crate::IsolationMode::BestEffort,
+                        env: Vec::new(),
+                    },
+                )
+            };
+            let mut views = Vec::new();
+            for command in [enter, show] {
+                let prepared = service.prepare(call(command)).await.expect("prepared");
+                let grant = service.approve(&prepared).await.expect("approved");
+                views.push((prepared, grant));
+            }
+            let (second, first) = (views.pop().expect("show"), views.pop().expect("enter"));
+            // The gate takes the calls of a task one by one (a second one
+            // prepared against the same sequence is a conflict), so the two are
+            // begun in turn and only their side effects run together, as the
+            // batch of a turn that held two shell calls would run them.
+            let cancel = harness_providers::CancellationToken::new();
+            let first = service
+                .begin(first.0, Some(first.1), &cancel)
+                .await
+                .expect("first begun");
+            let second = service
+                .begin(second.0, Some(second.1), &cancel)
+                .await
+                .expect("second begun");
+            let (super::Begun::Ready(first), super::Begun::Ready(second)) = (first, second) else {
+                panic!("both calls are ready to run");
+            };
+            let (a, b) = tokio::join!(
+                service.run_begun(&first, cancel.clone()),
+                service.run_begun(&second, cancel.clone()),
+            );
+            service.finish_begun(*first, a).await.expect("first runs");
+            let b = service.finish_begun(*second, b).await.expect("second runs");
+            let here = |view: &crate::ToolExecutionView| match &view.output {
+                crate::ToolOutput::Process { stdout, .. } => stdout.trim().replace('\\', "/"),
+                other => panic!("not a process result: {other:?}"),
+            };
+            let second_at = here(&b);
+            assert!(
+                second_at.ends_with("/workspace") || second_at.ends_with("/workspace/sub"),
+                "{second_at}"
+            );
+            let third = service.prepare(call(show)).await.expect("prepared");
+            let grant = service.approve(&third).await.expect("approved");
+            let third = service
+                .execute(third, Some(grant))
+                .await
+                .expect("third runs");
+            let third_at = here(&third);
+            assert!(
+                third_at.ends_with("/workspace/sub"),
+                "the first call's place was lost: {third_at} (the second saw {second_at})"
+            );
+            drop(service);
+            Arc::try_unwrap(store)
+                .expect("single owner")
+                .close()
+                .await
+                .expect("store closes");
+            let _ = std::fs::remove_dir_all(temp);
+        }
+    }
+
+    /// A guard that records the directory each command was judged from, and
+    /// refuses the ones judged from a folder named `sub`.
+    struct Recording {
+        dirs: std::sync::Mutex<Vec<String>>,
+        refuse_in_sub: bool,
+    }
+
+    impl super::ToolGuard for Recording {
+        fn check<'a>(
+            &'a self,
+            _action: &'a CodingToolAction,
+            _workspace_root: &'a str,
+            working_dir: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.dirs
+                    .lock()
+                    .expect("dirs")
+                    .push(working_dir.replace('\\', "/"));
+                (self.refuse_in_sub && working_dir.ends_with("sub"))
+                    .then(|| "not from sub".to_owned())
+            })
+        }
+    }
+
+    /// The guard judges call B while the shell is at the root; call A, which
+    /// goes into `sub`, runs before B does. Returns the directories the guard
+    /// was asked about and what B came to.
+    async fn judge_then_move(refuse_in_sub: bool) -> (Vec<String>, crate::ToolOutput) {
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-judged-{}",
+            harness_types::InputId::generate()
+        ));
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(workspace.join("sub")).expect("sub");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.join("data"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let guard = Arc::new(Recording {
+            dirs: std::sync::Mutex::default(),
+            refuse_in_sub,
+        });
+        let service = ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(ToolPolicy::default().with_mode(PolicyMode::FullAuto))
+            .with_guard(guard.clone());
+        let (session, task) = (SessionId::generate(), TaskId::generate());
+        harness_session::SessionService::new(Arc::clone(&store))
+            .admit_input(harness_session::AdmitInputRequest {
+                session_id: session.clone(),
+                task_id: task.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: harness_types::SourceAuthority::User,
+                raw_text: "go".to_owned(),
+                workspace: observe_workspace(ProjectId::generate(), &workspace)
+                    .expect("observation"),
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("input admitted");
+        let call = |command: &str| {
+            ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "test.actor",
+                workspace.clone(),
+                CodingToolAction::RunShell {
+                    command: command.to_owned(),
+                    timeout_ms: 60_000,
+                    isolation: crate::IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+            )
+        };
+        let (enter, show) = if cfg!(windows) {
+            ("Set-Location sub", "(Get-Location).Path")
+        } else {
+            ("cd sub", "pwd")
+        };
+        let a = service.prepare(call(enter)).await.expect("A prepared");
+        let b = service.prepare(call(show)).await.expect("B prepared");
+        let grant_a = service.approve(&a).await.expect("A approved");
+        let grant_b = service.approve(&b).await.expect("B approved");
+        let cancel = harness_providers::CancellationToken::new();
+        // B passes the guard at the root.
+        assert_eq!(service.guard_refusal(&b, &cancel).await, None);
+        let a = service
+            .begin(a, Some(grant_a), &cancel)
+            .await
+            .expect("A begun");
+        let b = service
+            .begin(b, Some(grant_b), &cancel)
+            .await
+            .expect("B begun");
+        let (super::Begun::Ready(a), super::Begun::Ready(b)) = (a, b) else {
+            panic!("both calls are ready to run");
+        };
+        // A runs and settles, and moves the shell into `sub`; then B runs.
+        let ran = service.run_begun(&a, cancel.clone()).await;
+        service.finish_begun(*a, ran).await.expect("A runs");
+        let ran = service.run_begun(&b, cancel.clone()).await;
+        let view = service.finish_begun(*b, ran).await.expect("B settles");
+        let dirs = guard.dirs.lock().expect("dirs").clone();
+        drop(service);
+        Arc::try_unwrap(store)
+            .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
+        (dirs, view.output)
+    }
+
+    /// The guard's verdict on B was for the root. B then runs in `sub`: it is
+    /// judged again from there, and not run on the stale verdict.
+    #[tokio::test]
+    async fn a_place_changed_after_the_guard_judged_is_judged_again_from_the_new_one() {
+        let (dirs, output) = judge_then_move(false).await;
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert!(dirs[0].ends_with("/workspace"), "{dirs:?}");
+        assert!(dirs[1].ends_with("/workspace/sub"), "{dirs:?}");
+        match output {
+            crate::ToolOutput::Process { stdout, .. } => {
+                assert!(stdout.trim().replace('\\', "/").ends_with("/workspace/sub"));
+            }
+            other => panic!("not a process result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_place_changed_after_the_guard_judged_can_be_refused_from_the_new_one() {
+        let (dirs, output) = judge_then_move(true).await;
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        match output {
+            crate::ToolOutput::Denied { reason, .. } => {
+                assert!(reason.contains("not from sub"), "{reason}");
+            }
+            other => panic!("the stale verdict let it run: {other:?}"),
+        }
+    }
+
+    fn grant_for(prepared: &PreparedToolRequest, shell_place: &str) -> crate::ApprovalGrant {
+        crate::ApprovalGrant {
+            approval_id: harness_types::ToolApprovalId::generate(),
+            session_id: prepared.request.session_id.clone(),
+            task_id: prepared.request.task_id.clone(),
+            invocation_id: prepared.request.invocation_id.clone(),
+            call_id: prepared.request.call_id.clone(),
+            actor_id: prepared.request.actor_id.clone(),
+            action_hash: prepared.action_hash.clone(),
+            workspace_root: prepared.workspace_root_text.clone(),
+            workspace_fingerprint: prepared.workspace_fingerprint.clone(),
+            policy_revision: prepared.policy_revision,
+            tool_revision: u64::from(crate::TOOL_CONTRACT_VERSION),
+            shell_place: shell_place.to_owned(),
+            expires_at_unix_ms: None,
+        }
+    }
+
+    fn prepared_shell(command: &str) -> PreparedToolRequest {
+        let root = std::env::temp_dir().join("ha-g-approval-place");
+        let action = CodingToolAction::RunShell {
+            command: command.to_owned(),
+            timeout_ms: 5_000,
+            isolation: crate::IsolationMode::BestEffort,
+            env: Vec::new(),
+        };
+        PreparedToolRequest {
+            request: ToolRequest::new(
+                SessionId::generate(),
+                TaskId::generate(),
+                "test.actor",
+                root.clone(),
+                action.clone(),
+            ),
+            action_hash: action.canonical_hash().expect("canonical action hash"),
+            final_action: action,
+            workspace_root: root.clone(),
+            workspace_root_text: root.to_string_lossy().into_owned(),
+            workspace_fingerprint: ContentHash::from_bytes(b"workspace"),
+            workspace_identity_hash: ContentHash::from_bytes(b"identity"),
+            project_id: ProjectId::generate(),
+            policy_revision: 0,
+            policy_denial: None,
+        }
+    }
+
+    /// An approval given for a call that starts in one place is not good for the
+    /// same call in another: the directory or the `PATH` it runs with is part of
+    /// what the person approved.
+    #[test]
+    fn an_approval_given_for_one_place_does_not_run_the_call_in_another() {
+        let prepared = prepared_shell("make");
+        let at_root = grant_for(&prepared, "");
+        assert!(super::approval_mismatch(&prepared, &at_root, "").is_none());
+        let in_sub = r#"{"dir":"/w/sub","path":null}"#;
+        let (code, reason) = super::approval_mismatch(&prepared, &at_root, in_sub)
+            .expect("an approval for the root is not one for a folder");
+        assert_eq!(code, ErrorCode::ApprovalStale);
+        assert!(reason.contains("approval does not bind"), "{reason}");
+        let for_sub = grant_for(&prepared, in_sub);
+        assert!(super::approval_mismatch(&prepared, &for_sub, in_sub).is_none());
+        assert!(super::approval_mismatch(&prepared, &for_sub, "").is_some());
+        assert!(
+            super::approval_mismatch(&prepared, &for_sub, r#"{"dir":"/w/sub","path":"/x"}"#)
+                .is_some(),
+            "nor is one for a folder good with another PATH"
+        );
+    }
+
+    /// A rule that allows `run_shell(echo *)` stops deciding once a shell call
+    /// has changed `PATH`: the call asks, and the person who is asked is told.
+    #[tokio::test]
+    async fn an_allow_rule_asks_while_a_shell_call_has_changed_the_path() {
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-rule-path-{}",
+            harness_types::InputId::generate()
+        ));
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.join("data"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let policy =
+            ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![crate::ToolPatternRule::allow(
+                "run_shell(*)",
+                "agreed",
+            )]);
+        let service = ToolExecutionService::new(Arc::clone(&store)).with_policy(policy);
+        let (session, task) = (SessionId::generate(), TaskId::generate());
+        harness_session::SessionService::new(Arc::clone(&store))
+            .admit_input(harness_session::AdmitInputRequest {
+                session_id: session.clone(),
+                task_id: task.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: harness_types::SourceAuthority::User,
+                raw_text: "go".to_owned(),
+                workspace: observe_workspace(ProjectId::generate(), &workspace)
+                    .expect("observation"),
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("input admitted");
+        let call = |command: &str| {
+            ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "test.actor",
+                workspace.clone(),
+                CodingToolAction::RunShell {
+                    command: command.to_owned(),
+                    timeout_ms: 60_000,
+                    isolation: crate::IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+            )
+        };
+        let change = if cfg!(windows) {
+            "$env:PATH = 'C:\\zz-other-dir;' + $env:PATH"
+        } else {
+            "PATH=/zz-other-dir:$PATH; export PATH"
+        };
+        let first = service.prepare(call(change)).await.expect("prepared");
+        let second = service.prepare(call("echo hi")).await.expect("prepared");
+        assert!(matches!(
+            service.decision(&second),
+            crate::Decision::Allow { .. }
+        ));
+        assert_eq!(service.location_summary(&second), None);
+        let grant = service.approve(&first).await.expect("approved");
+        service.execute(first, Some(grant)).await.expect("runs");
+        assert_eq!(service.decision(&second), crate::Decision::Ask);
+        let summary = service.location_summary(&second).expect("told");
+        assert!(summary.contains("zz-other-dir"), "{summary}");
+        drop(service);
+        Arc::try_unwrap(store)
+            .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
     /// The kinds a host may auto-approve, and the three that it never may.
     ///
     /// Written as an exhaustive list on purpose: this predicate is the whole
@@ -3419,6 +4094,8 @@ mod tests {
             ToolKind::GitStatus,
             ToolKind::GitDiff,
             ToolKind::GitLog,
+            ToolKind::GitSearch,
+            ToolKind::GitShow,
         ] {
             assert!(
                 kind.is_read_only(),

@@ -425,7 +425,10 @@ for name in glob.glob(os.path.join(sys.argv[1], "sessions", "*", "harness", "ref
         except ValueError:
             continue
         for edit in record.get("appliedEdits") or []:
-            if edit.get("kind") == "skill_file" and edit.get("id") == sys.argv[2] and edit.get("action") == "update" and edit.get("applied"):
+            # A revision of a skill is an edit since 0.9.12 (a proven skill takes no
+            # whole update), and the model may send one for an unproven skill too:
+            # its script_runs are checked the same way (2026-11-20 run: an edit).
+            if edit.get("kind") == "skill_file" and edit.get("id") == sys.argv[2] and edit.get("action") in ("update", "edit", "patch") and edit.get("applied"):
                 if "scriptRuns" in edit or "scriptRunsUnconfirmed" in edit:
                     state = "proposed"
                 elif state == "none":

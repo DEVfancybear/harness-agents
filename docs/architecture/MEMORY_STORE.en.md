@@ -473,6 +473,49 @@ page out; a `tree` filter reads a page at `/knowledge/<scope>/<its folders>`;
   same session, by `sequence`, so a reader can walk the thread without searching
   again.
 
+### The repository's own history: `git_search` and `git_show`
+
+Memory and the journal hold what the conversations said. What the repository
+itself recorded of its past, its commits, could be listed (`git_log`, the latest
+ones) but not searched, and a commit's change could not be read. Two read-only
+tools cover that, after RepoMem (arXiv 2510.01003, "Improving Code Localization
+with Repository Memory"), where letting an agent search past commit messages and
+read the found commit's diff raised file localization (SWE-bench Verified
+Acc@5 71.6 to 74.3 from this part alone):
+
+- **`git_search`** reads the messages of the newest 5000 commits (one `git log`
+  with an argument list, never a command string) and ranks them against the
+  query with BM25 over the words `harness_types::readout::words` reads (the
+  rest of ha reads them too), plus the pieces of a word spelled with a seam:
+  `words` lower-cases before it splits, so `parseHeader` was only `parseheader`
+  and did not find `parse_header`; the terms are now also cut from the original
+  case at a lower-to-upper step (`HTTPServer` is `http` and `server`) and
+  between a letter and a digit, for the query and every commit alike. File paths
+  become terms. The subject counts three times a word of the body; the changed file
+  names count as words too, so a file's own history is found by its name. It
+  uses `bm25_idf` and `bm25_term` of `harness_types::search`, the one BM25 of
+  the crates that cannot see the memory index. A hit shows the short hash, date,
+  author, subject, the start of the body and the first eight changed files; a
+  longer history than 5000 commits, or a log too large to hold (8 MiB), is
+  said in the answer. `path` keeps only commits that touched it. The file names
+  are the workspace's own: when the workspace is a folder of the repository (its
+  place read with `git rev-parse --show-prefix`), `app/src/a.rs` is shown as
+  `src/a.rs`, and a file outside it as `(outside the workspace) ../other.txt`
+  rather than dropped. (They were printed from the repository's root.)
+- **`git_show`** resolves `commit` with `git rev-parse --verify <rev>^{commit}`
+  first, after refusing anything that is not one revision (an option, a space,
+  a range), and reads the full hash from then on. It prints the hash, author,
+  date, the whole message, the changed files with added and removed lines
+  (`--numstat`) and the diff, paged by `offset` and `length` as `history_read`
+  pages: the answer names the `offset` that reads on. In a workspace below the
+  repository root the diff is read with `--relative`, so it names the same paths
+  as the file list, and says that the files marked outside are not in it.
+
+RepoMem's other half, "semantic memory" (an LLM summary of each of the 200 most
+edited files), was not taken: it costs a model call per file, it was worth about
+2 points in the paper, and it hurt repositories with little history. The
+commit search is the "episodic" half, and it needs no model call.
+
 ## 8. The `ha memory` command
 
 `ha memory` works on the stores and on a project's markdown memory store
