@@ -1242,6 +1242,18 @@ impl InteractiveController {
     /// has to be: a key must never act on a list the user cannot see. The plain
     /// renderer draws no menu, and a panel or picker that owns the keyboard
     /// replaces it, so neither may consume an arrow or an Enter for it.
+    /// The highlight is on a flag the menu offered on a blank word, and the
+    /// person did not move it there.
+    fn offered_flag(&self) -> bool {
+        !self.editor.suggestion_moved()
+            && self.editor.display_buffer().ends_with(' ')
+            && self
+                .editor
+                .suggestions()
+                .get(self.editor.suggestion_selected())
+                .is_some_and(|item| item.label.starts_with('-'))
+    }
+
     fn suggestion_menu_open(&self) -> bool {
         !self.plain
             && self.pending_approval.is_none()
@@ -1613,6 +1625,12 @@ impl InteractiveController {
             // through it, as prime-agent's and Claude Code's panels are, and the
             // composer is not being typed into while one is up. Escape still
             // closes it, which is what acceptance U09 asserts.
+            // Typing means the person is done reading: the panel closes and
+            // the key goes to the composer, which shows its cursor and its
+            // menu again (`/features`, then `/` opens the command menu).
+            if matches!(key, Key::Char(character) if !character.is_control()) {
+                let _ = self.editor.take_overlay();
+            }
             let scrolled = match key {
                 Key::Up => self.editor.scroll_overlay(-1),
                 Key::Down => self.editor.scroll_overlay(1),
@@ -1734,12 +1752,21 @@ impl InteractiveController {
                     self.editor.accept_suggestion();
                     return vec![Effect::Redraw];
                 }
-                Key::Enter => {
+                // A flag the menu offers on a blank word is optional: Enter
+                // runs the line as it is (`/new ` starts a session) unless the
+                // person moved the highlight to the flag. A command whose
+                // blank offers nothing (`/resume`, `/learn`) runs once its
+                // name is completed.
+                Key::Enter if !self.offered_flag() => {
                     let embedded = self.editor.suggestion_is_embedded();
                     self.editor.accept_suggestion();
+                    let line = self.editor.display_buffer();
+                    let whole = line
+                        .strip_suffix(' ')
+                        .is_some_and(|name| super::commands::runs_bare(name));
                     if embedded
-                        || self.editor.display_buffer().ends_with(' ')
-                        || !self.editor.suggestions().is_empty()
+                        || (!whole
+                            && (line.ends_with(' ') || !self.editor.suggestions().is_empty()))
                     {
                         return vec![Effect::Redraw];
                     }
@@ -10547,8 +10574,8 @@ Command: \"npm run build\""
             "plain mode must not complete a list it never showed: {lines}"
         );
 
-        // TUI with a panel open: the panel owns the frame, so the same draft is
-        // submitted rather than silently completed into a list nobody can see.
+        // TUI with a panel open: typing closes it, so the menu that answers
+        // the draft is the one on screen.
         let mut tui = tui_bench(true);
         let _ = tui.controller.boot_lines();
         let _ = submit_text(&mut tui.controller, "/help");
@@ -10558,9 +10585,14 @@ Command: \"npm run build\""
         );
         type_text(&mut tui.controller, "/he");
         assert!(
-            !tui.controller.ui_state().suggestions.is_empty(),
-            "the editor still holds the candidates; the frame is what hides them"
+            tui.controller.ui_state().modal.is_none(),
+            "typing closed it"
         );
+        assert!(
+            tui.controller.suggestion_menu_open(),
+            "the menu for the draft is drawn"
+        );
+        let _ = tui.controller.handle_key(Key::Esc);
         let _ = tui.controller.handle_key(Key::Enter);
         assert!(
             tui.controller
@@ -14241,6 +14273,87 @@ Command: \"npm run build\""
         let _ = submit_text(&mut harness.controller, "/model");
         assert_eq!(harness.controller.editor.text(), "/model ");
         assert!(!harness.controller.editor.suggestions().is_empty());
+    }
+
+    /// A panel open (`/features`) does not keep the composer from being typed
+    /// into: a typed key closes it, and the menu answers that key.
+    #[test]
+    fn typing_closes_a_reference_panel_and_reaches_the_composer() {
+        let harness = tui_bench(true);
+        let mut controller = harness.controller;
+        let _ = controller.boot_lines();
+        controller
+            .editor
+            .open_overlay("/features", vec!["no feature list".to_owned()]);
+        let _ = controller.handle_key(Key::Down);
+        assert!(controller.editor.overlay().is_some(), "arrows scroll it");
+        type_text(&mut controller, "/fe");
+        assert!(controller.editor.overlay().is_none());
+        assert_eq!(controller.editor.text(), "/fe");
+        assert!(controller.suggestion_menu_open(), "the menu is back");
+    }
+
+    /// A command whose argument is optional shows what it takes and runs on
+    /// Enter, typed in full or completed from its beginning.
+    #[test]
+    fn an_optional_argument_command_runs_on_enter() {
+        let harness = tui_bench(true);
+        let mut controller = harness.controller;
+        let _ = controller.boot_lines();
+        type_text(&mut controller, "/resume");
+        assert!(
+            controller.editor.suggestions()[0]
+                .label
+                .starts_with("/resume ["),
+            "{:?}",
+            controller.editor.suggestions()
+        );
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(controller.editor.text(), "", "Enter ran /resume");
+        type_text(&mut controller, "/resu");
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(
+            controller.editor.text(),
+            "",
+            "Enter completed and ran /resume"
+        );
+    }
+
+    /// A blank word offers the command's flags; Enter runs the line as it is,
+    /// and a flag the person moves to is what Enter takes.
+    #[test]
+    fn a_blank_word_offers_the_flags_and_enter_runs_the_line() {
+        let harness = tui_bench(true);
+        let mut controller = harness.controller;
+        let _ = controller.boot_lines();
+        type_text(&mut controller, "/refine ");
+        assert!(
+            controller
+                .editor
+                .suggestions()
+                .iter()
+                .any(|item| item.label.starts_with("--rollback")),
+            "{:?}",
+            controller.editor.suggestions()
+        );
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(controller.editor.text(), "", "Enter ran /refine as typed");
+        type_text(&mut controller, "/refine ");
+        let _ = controller.handle_key(Key::Down);
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(
+            controller.editor.text(),
+            "/refine --rollback ",
+            "the flag moved to is taken"
+        );
+        // `/new` shows its flags first; the second Enter starts the session.
+        controller.editor.set_text("");
+        type_text(&mut controller, "/new");
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(controller.editor.text(), "/new ");
+        assert!(!controller.editor.suggestions().is_empty(), "its flags");
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(controller.editor.text(), "", "Enter ran /new");
     }
 
     /// The person's way through the review queue: `/memory` lists the waiting

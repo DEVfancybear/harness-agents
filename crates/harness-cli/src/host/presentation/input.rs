@@ -117,6 +117,9 @@ pub struct LineEditor {
     suggestion: Vec<MenuItem>,
     /// Which candidate the highlight is on.
     suggestion_index: usize,
+    /// The person moved the highlight since the menu last changed: the row is
+    /// their choice, not the menu's first offer.
+    suggestion_moved: bool,
     /// Skills and prompt commands, offered beside the built-in commands.
     menu_commands: Vec<MenuCommand>,
     /// Argument values that change at run time (`/model`, `/login`).
@@ -238,7 +241,14 @@ impl LineEditor {
                 .saturating_add(delta.unsigned_abs() as usize)
         };
         self.suggestion_index = next.min(last);
+        self.suggestion_moved = true;
         true
+    }
+
+    /// Whether the person moved the highlight to the row it is on.
+    #[must_use]
+    pub const fn suggestion_moved(&self) -> bool {
+        self.suggestion_moved
     }
 
     /// Accept the highlighted candidate, as prime-agent does: a command that takes
@@ -857,6 +867,7 @@ impl LineEditor {
     /// secret buffer never offers anything, whatever is pasted into it.
     fn refresh_suggestion(&mut self) {
         self.suggestion_index = 0;
+        self.suggestion_moved = false;
         self.suggestion.clear();
         if self.secret {
             return;

@@ -97,9 +97,25 @@ fn authorization_server_metadata_urls(issuer: &Url) -> Vec<String> {
 
 /// The `resource_metadata` pointer of a `WWW-Authenticate` header.
 fn header_resource_metadata(value: &str) -> Option<String> {
+    header_parameter(value, "resource_metadata")
+}
+
+/// The `scope` a `WWW-Authenticate` header asks for (MCP's scope selection).
+fn header_scope(value: &str) -> Option<String> {
+    header_parameter(value, "scope").filter(|scope| !scope.trim().is_empty())
+}
+
+/// One quoted parameter of a `WWW-Authenticate` header, by its exact name.
+fn header_parameter(value: &str, name: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
-    let at = lower.find("resource_metadata")?;
-    let rest = value[at + "resource_metadata".len()..].trim_start();
+    let at = lower.match_indices(name).map(|(at, _)| at).find(|&at| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| before == ',' || before.is_whitespace())
+            && lower[at + name.len()..].trim_start().starts_with('=')
+    })?;
+    let rest = value[at + name.len()..].trim_start();
     let rest = rest.strip_prefix('=')?.trim_start().strip_prefix('"')?;
     let mut out = String::new();
     let mut chars = rest.chars();
@@ -264,15 +280,50 @@ fn discover_server(issuer: &str) -> Result<ServerMetadata, String> {
     ))
 }
 
-/// What discovery found: the server metadata, and the resource indicator
-/// when the server publishes protected-resource metadata.
-fn discover(url: &str) -> Result<(ServerMetadata, Option<String>), String> {
+/// What discovery found: the server metadata, the resource indicator when
+/// the server publishes protected-resource metadata, and the scope to ask for.
+struct Discovered {
+    metadata: ServerMetadata,
+    resource: Option<String>,
+    scope: Option<String>,
+}
+
+/// MCP's scope selection: the scope the server's challenge names, else the
+/// resource's own `scopes_supported`. The authorization server's list is the
+/// whole server's and may hold scopes this client may not ask for (Vercel's
+/// `ema_issuer:manage`, refused as `invalid_scope`); it is asked for only
+/// when the server publishes no resource metadata.
+fn chosen_scope(
+    challenge: Option<String>,
+    resource_metadata: Option<&serde_json::Value>,
+    server: &ServerMetadata,
+) -> Option<String> {
+    let joined = |scopes: Vec<String>| Some(scopes.join(" ")).filter(|scope| !scope.is_empty());
+    challenge.or_else(|| match resource_metadata {
+        Some(value) => joined(
+            value
+                .get("scopes_supported")
+                .and_then(serde_json::Value::as_array)
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(|scope| scope.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        None => server.scopes_supported.clone().and_then(joined),
+    })
+}
+
+fn discover(url: &str) -> Result<Discovered, String> {
     let resource_url = validated_url(url, "MCP server URL")?;
     // The probe never carries a token.
-    let pointer = http("GET", url, None, None)
+    let challenge = http("GET", url, None, None)
         .ok()
-        .and_then(|(_, authenticate, ..)| authenticate)
-        .and_then(|value| header_resource_metadata(&value));
+        .and_then(|(_, authenticate, ..)| authenticate);
+    let pointer = challenge.as_deref().and_then(header_resource_metadata);
+    let challenge_scope = challenge.as_deref().and_then(header_scope);
     let candidate = match &pointer {
         Some(pointer) => validated_url(pointer, "resource_metadata")?.to_string(),
         None => resource_metadata_url(&resource_url),
@@ -293,12 +344,21 @@ fn discover(url: &str) -> Result<(ServerMetadata, Option<String>), String> {
                 .ok_or_else(|| {
                     "Protected-resource metadata has no authorization_servers".to_owned()
                 })?;
-            Ok((discover_server(issuer)?, Some(resource)))
+            let metadata = discover_server(issuer)?;
+            Ok(Discovered {
+                scope: chosen_scope(challenge_scope, Some(&value), &metadata),
+                metadata,
+                resource: Some(resource),
+            })
         }
-        Ok(None) if pointer.is_none() => Ok((
-            discover_server(&resource_url.origin().ascii_serialization())?,
-            None,
-        )),
+        Ok(None) if pointer.is_none() => {
+            let metadata = discover_server(&resource_url.origin().ascii_serialization())?;
+            Ok(Discovered {
+                scope: chosen_scope(challenge_scope, None, &metadata),
+                metadata,
+                resource: None,
+            })
+        }
         Ok(None) => Err(format!("GET {candidate} failed: 404")),
         Err(error) => Err(error),
     }
@@ -497,7 +557,11 @@ pub fn login(
     progress: &dyn Fn(&str),
 ) -> Result<(), String> {
     progress(&format!("Discovering OAuth metadata for {server}..."));
-    let (metadata, resource) = discover(url)?;
+    let Discovered {
+        metadata,
+        resource,
+        scope: discovered_scope,
+    } = discover(url)?;
     let client_id = if let Some(client_id) = client_id {
         client_id.to_owned()
     } else {
@@ -516,12 +580,7 @@ pub fn login(
     let redirect = redirect_uri(port);
     let scope = scopes
         .map(str::to_owned)
-        .or_else(|| {
-            metadata
-                .scopes_supported
-                .as_ref()
-                .map(|scopes| scopes.join(" "))
-        })
+        .or(discovered_scope)
         .unwrap_or_default();
     let mut params = vec![
         ("client_id", client_id.as_str()),
@@ -677,8 +736,9 @@ mod tests {
     }
 
     use super::{
-        authorization_server_metadata_urls, canonical_resource, code_from,
-        header_resource_metadata, resource_metadata_url, server_metadata, validated_url,
+        authorization_server_metadata_urls, canonical_resource, chosen_scope, code_from,
+        header_resource_metadata, header_scope, resource_metadata_url, server_metadata,
+        validated_url,
     };
     use reqwest::Url;
 
@@ -798,6 +858,58 @@ mod tests {
         assert_eq!(
             super::bearer(&auth, "linear", "https://mcp.example/mcp"),
             Ok(Some("fresh".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_scope_is_the_challenge_s_then_the_resource_s_not_the_server_s() {
+        // Vercel: the authorization server lists a scope a client may not ask
+        // for; the resource asks for `openid` only.
+        let server = server_metadata(
+            &serde_json::json!({
+                "issuer": "https://vercel.com",
+                "authorization_endpoint": "https://vercel.com/oauth/authorize",
+                "token_endpoint": "https://api.vercel.com/login/oauth/token",
+                "scopes_supported": ["openid", "email", "profile", "offline_access", "ema_issuer:manage"],
+            }),
+            "https://vercel.com",
+        )
+        .expect("metadata");
+        let resource = serde_json::json!({
+            "resource": "https://mcp.vercel.com/",
+            "authorization_servers": ["https://vercel.com"],
+            "scopes_supported": ["openid"],
+        });
+        assert_eq!(
+            chosen_scope(None, Some(&resource), &server).as_deref(),
+            Some("openid")
+        );
+        let challenge = header_scope(
+            r#"Bearer error="insufficient_scope", scope="files:read files:write", resource_metadata="https://x/.well-known/oauth-protected-resource""#,
+        );
+        assert_eq!(challenge.as_deref(), Some("files:read files:write"));
+        assert_eq!(
+            chosen_scope(challenge, Some(&resource), &server).as_deref(),
+            Some("files:read files:write")
+        );
+        // Resource metadata without scopes asks for none.
+        let bare =
+            serde_json::json!({"resource": "https://x/", "authorization_servers": ["https://x"]});
+        assert_eq!(chosen_scope(None, Some(&bare), &server), None);
+        // No resource metadata at all: the server's own list, as before.
+        assert!(
+            chosen_scope(None, None, &server)
+                .is_some_and(|scope| scope.starts_with("openid email"))
+        );
+        // `resource_metadata` is not read as `scope`, nor the reverse.
+        assert_eq!(
+            header_scope(r#"Bearer resource_metadata="https://x/meta""#),
+            None
+        );
+        assert_eq!(
+            header_resource_metadata(r#"Bearer scope="a", resource_metadata="https://x/meta""#)
+                .as_deref(),
+            Some("https://x/meta")
         );
     }
 

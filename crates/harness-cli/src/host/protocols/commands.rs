@@ -538,6 +538,21 @@ fn suggest_names(buffer: &str, extra: &[MenuCommand]) -> Vec<MenuItem> {
     rank(scored, query.is_empty())
 }
 
+/// Whether the command `name` alone is whole and its blank argument offers
+/// nothing to choose: Enter on its name runs it (`/resume` opens the picker,
+/// `/learn` learns) rather than stopping at a space with an empty menu.
+#[must_use]
+pub fn runs_bare(name: &str) -> bool {
+    let Some(command) = builtin(name) else {
+        return false;
+    };
+    if !command.arguments.starts_with('[') {
+        return false;
+    }
+    let blank = slot(command.name, &[], &ArgumentOptions::new());
+    blank.typed_only || (blank.values.is_empty() && blank.flags.is_empty())
+}
+
 /// The rows for the word being typed after a command: the values its grammar
 /// allows there ([`slot`]), the best match first.
 fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> Vec<MenuItem> {
@@ -564,7 +579,10 @@ fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> V
             .to_owned()
     };
     let mut options = slot.values;
-    if typed.starts_with('-') {
+    // Right after the command a blank offers its flags too (`/refine `);
+    // later a blank is the gap between words of free text, where a flag is
+    // offered only once its dash is typed.
+    if (typed.is_empty() && words.is_empty()) || typed.starts_with('-') {
         options.extend(slot.flags);
     }
     // A value already on the line is not offered again (a second id, a flag).
@@ -596,7 +614,7 @@ fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> V
             // A value that names more input after its first word completes to
             // that word and a space: the argument is not finished, so accepting
             // it must not submit (`/mcp add` alone has no server to add).
-            let takes_more = value.trim() != first;
+            let takes_more = slot.more || value.trim() != first;
             Some((
                 score,
                 order,
@@ -654,8 +672,9 @@ struct Slot {
     /// own placeholder after its first word (`accept <id>...`): the menu shows
     /// it whole, and choosing it types the first word and a space.
     values: Vec<(String, String)>,
-    /// Flags, offered once the word starts with `-`, as a shell offers them:
-    /// a blank word with Enter keeps running the command as it is.
+    /// Flags, offered after the values on the blank right after the command,
+    /// and once a word starts with `-`. A flag is optional: Enter on a blank
+    /// runs the line as it is, unless the person moved the highlight to one.
     flags: Vec<(String, String)>,
     /// The word may be free text (`/goal <objective>`): only a value it begins
     /// is offered, so a word of a sentence never turns into a subcommand.
@@ -667,6 +686,14 @@ struct Slot {
     /// word of the description finds one (`flutter` finds the memory change
     /// about Flutter).
     by_description: bool,
+    /// More must follow a value here (`/heartbeat every 10m <instruction>`):
+    /// choosing one types a space, and Enter does not run the line yet.
+    more: bool,
+}
+
+/// `slot`, whose values more words must follow.
+fn then_more(slot: Slot) -> Slot {
+    Slot { more: true, ..slot }
 }
 
 fn fixed(values: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -956,7 +983,7 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
                 .filter(|word| !word.starts_with("--"))
                 .collect();
             match when.as_slice() {
-                [] => free(
+                [] => then_more(free(
                     &[
                         ("in <duration>", "once, after a delay: in 10m"),
                         ("every <duration>", "again and again: every 1h"),
@@ -967,8 +994,10 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
                         ("@monthly", "the first of every month"),
                     ],
                     DELIVERY,
-                ),
-                ["in" | "every" | "each"] if !last.starts_with("--") => free(INTERVALS, &[]),
+                )),
+                ["in" | "every" | "each"] if !last.starts_with("--") => {
+                    then_more(free(INTERVALS, &[]))
+                }
                 _ => Slot::default(),
             }
         }
@@ -976,7 +1005,7 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
             &[("every <interval>", "how often it runs (5m without it)")],
             DELIVERY,
         ),
-        ("/heartbeat", ["every" | "each"]) => free(INTERVALS, &[]),
+        ("/heartbeat", ["every" | "each"]) => then_more(free(INTERVALS, &[])),
         ("/heartbeat", ["every" | "each", _, rest @ ..])
             if rest.iter().all(|word| word.starts_with("--")) =>
         {
@@ -1058,6 +1087,8 @@ fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
                 .insert(0, ("latest".to_owned(), "the latest session".to_owned()));
             slot.flags = fixed(&[("--compact", "summarize it first")]);
             slot.free = true;
+            // A blank runs `/resume` as it is: the session picker.
+            slot.typed_only = true;
             slot
         }
         ("/fork", []) | ("/tree", ["label"]) => records(dynamic, values::TURNS),
@@ -1311,7 +1342,7 @@ mod tests {
 
     // Argument completion, command by command.
 
-    use super::{MenuItem, SLASH_COMMANDS, matching, values};
+    use super::{MenuItem, SLASH_COMMANDS, matching, runs_bare, values};
 
     fn records(entries: &[(&'static str, &[(&str, &str)])]) -> ArgumentOptions {
         let mut dynamic = ArgumentOptions::new();
@@ -1446,8 +1477,13 @@ mod tests {
             values::REFINEMENTS,
             &[("refine_1700_a", "Tightened the memory digest · global")],
         )]);
+        assert_eq!(
+            heads("/refine ", &dynamic),
+            ["--global", "--rollback", "--curate", "--history"],
+            "right after the command its flags are offered"
+        );
         assert!(
-            heads("/refine ", &dynamic).is_empty(),
+            heads("/refine tighten ", &dynamic).is_empty(),
             "instructions are free text"
         );
         assert_eq!(
@@ -1552,12 +1588,50 @@ mod tests {
         assert_eq!(heads("/schedule cancel ", &dynamic), ["job-1"]);
     }
 
+    /// A command whose argument is optional and offers nothing on a blank is
+    /// whole by its name: Enter runs it, as `/copy` runs.
+    #[test]
+    fn a_command_whole_without_its_argument_runs_on_enter() {
+        assert!(bare("/copy").is_empty(), "/copy needs no menu");
+        // Nothing to choose on a blank: the name alone runs.
+        for name in ["/resume", "/learn", "/name"] {
+            assert!(runs_bare(name), "{name}");
+        }
+        // Values or flags to choose, or an argument that must be given: the
+        // name opens the argument menu first.
+        for name in [
+            "/new",
+            "/refine",
+            "/effort",
+            "/steer",
+            "/heartbeat",
+            "/copy",
+        ] {
+            assert!(!runs_bare(name), "{name}");
+        }
+        // The row still shows what the command takes.
+        assert!(bare("/resume")[0].starts_with("/resume"));
+    }
+
     #[test]
     fn heartbeats_offer_the_interval_flags_and_the_heartbeats() {
         let dynamic = records(&[(values::HEARTBEATS, &[("hb-1", "active · 10m · check CI")])]);
-        assert_eq!(bare("/heartbeat "), ["every"]);
+        assert_eq!(bare("/heartbeat "), ["every", "--steer", "--follow-up"]);
         assert_eq!(bare("/heartbeat -"), ["--steer", "--follow-up"]);
         assert_eq!(bare("/heartbeat every ")[0], "5m");
+        // The instruction follows the interval: choosing one does not run it.
+        assert_eq!(
+            rows("/heartbeat every ", &ArgumentOptions::new())[0].completion,
+            "/heartbeat every 5m "
+        );
+        assert_eq!(
+            rows("/schedule add @da", &ArgumentOptions::new())[0].completion,
+            "/schedule add @daily "
+        );
+        assert_eq!(
+            rows("/schedule add in 1", &ArgumentOptions::new())[0].completion,
+            "/schedule add in 10m "
+        );
         assert_eq!(bare("/heartbeat every 10m -"), ["--steer", "--follow-up"]);
         assert!(
             bare("/heartbeat check").is_empty(),
@@ -1684,10 +1758,13 @@ mod tests {
             bare("/agents messages "),
             ["status", "pause", "resume", "clear"]
         );
-        assert_eq!(heads("/resume ", &dynamic), ["latest", "s-42"]);
+        // A blank runs `/resume` as it is, the session picker: a session is
+        // offered once its name is begun.
+        assert!(heads("/resume ", &dynamic).is_empty());
+        assert_eq!(heads("/resume l", &dynamic), ["latest"]);
         assert_eq!(heads("/resume pars", &dynamic), ["s-42"]);
         assert_eq!(heads("/resume -", &dynamic), ["--compact"]);
-        assert_eq!(heads("/resume --compact ", &dynamic), ["latest", "s-42"]);
+        assert_eq!(heads("/resume --compact s", &dynamic), ["s-42"]);
         assert_eq!(heads("/fork ", &dynamic), ["1", "2"]);
         assert_eq!(heads("/tree ", &dynamic), ["1", "2", "label"]);
         assert_eq!(heads("/tree label ", &dynamic), ["1", "2"]);
