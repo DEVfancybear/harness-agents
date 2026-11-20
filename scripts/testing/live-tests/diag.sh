@@ -209,6 +209,64 @@ for root, _, files in os.walk(sys.argv[2]):
                 sys.exit(1)
 EOF'
 check "nothing from private/ is in it" '! find "$RX/report" -path "*private*" | grep -q .'
+
+echo "== a running worker and one conversation's steps (bug report 20261120-135928)"
+# A worker serving the conversation a minute before the report was listed under
+# Problems as "no exit record - still running, or killed or crashed".
+WPID=$("$PY" - "$HA_HOME/data/workers" <<'EOF'
+import glob, json, os, subprocess, sys
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    pid = json.load(open(path, encoding="utf-8")).get("pid")
+    listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
+    if f'"{pid}"' in listed:
+        print(pid)
+        break
+EOF
+)
+WPID=$(printf '%s' "$WPID" | tr -d '\r')
+echo "   worker running: pid ${WPID:-none}"
+check "precondition: a worker runs as the report is written" '[ -n "$WPID" ]'
+check "the report says the running worker runs" '[ -n "$WPID" ] && grep -q "^- running: worker pid $WPID," "$S"'
+check "and does not list it as a process without an exit record" '[ -n "$WPID" ] && ! grep -q "^- worker pid $WPID, .*no exit record" "$S"'
+# A report of one conversation held every conversation's run steps: a step
+# names its run only.
+CONV=$("$PY" - "$RX/report" <<'EOF'
+import collections, glob, json, os, sys
+counts = collections.Counter()
+for path in glob.glob(os.path.join(sys.argv[1], "store", "project-*.json")):
+    runs = json.load(open(path, encoding="utf-8"))["runs"]
+    task = runs["columns"].index("task_id")
+    for row in runs["rows"]:
+        counts[row[task]] += 1
+print(counts.most_common(1)[0][0] if len(counts) >= 2 else "")
+EOF
+)
+CONV=$(printf '%s' "$CONV" | tr -d '\r')
+check "precondition: the project has runs of two conversations or more" '[ -n "$CONV" ]'
+"$HA" bug-report --since 1h --task "$CONV" --out "$RX/report-task.zip" > /dev/null 2>&1
+steps_of() { "$PY" - "$RX/report-task.zip" "$CONV" <<'EOF'
+import json, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+own = other = 0
+for name in z.namelist():
+    if name.startswith("store/project-") and name.endswith(".json") and name.count("/") == 1:
+        steps = json.loads(z.read(name))["run_steps"]
+        if "task_id" not in steps["columns"]:
+            other += len(steps["rows"])
+            continue
+        task = steps["columns"].index("task_id")
+        for row in steps["rows"]:
+            if row[task] == sys.argv[2]:
+                own += 1
+            else:
+                other += 1
+print(own, other)
+EOF
+}
+read -r OWN_STEPS OTHER_STEPS <<< "$(steps_of | tr -d '\r')"
+echo "   the conversation's report: its steps ${OWN_STEPS:-?}, other steps ${OTHER_STEPS:-?}"
+check "a conversation's report holds its own run steps" '[ "${OWN_STEPS:-0}" -ge 1 ]'
+check "and no other conversation's" '[ "${OTHER_STEPS:-1}" -eq 0 ]'
 "$HA" diag timeline --since 1h --level warn > "$RX/timeline.txt" 2>&1
 check "ha diag timeline prints the warnings" 'grep -q "worker.died\|open_failed" "$RX/timeline.txt"'
 

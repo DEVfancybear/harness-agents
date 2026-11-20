@@ -2043,6 +2043,14 @@ impl LiveTurn {
         }
     }
 
+    /// Let go of the conversation this session held open: the pane has left
+    /// it (`/new`, `/resume`, a fork).
+    fn let_go(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = None;
+        }
+    }
+
     /// A new turn starts from what it resolved.
     fn start(&self, level: harness_providers::ThinkingLevel) {
         if let Ok(mut current) = self.selection.lock() {
@@ -5189,6 +5197,9 @@ impl SessionPort for AgentSessionService {
     }
 
     fn conversation_left(&mut self) {
+        // This pane leaves its conversation: no longer held open here, so its
+        // owed log is written now, while one another pane holds stays owed.
+        self.live.let_go();
         if !super::session_log::enabled(&self.config_file, &self.environment)
             || tokio::runtime::Handle::try_current().is_err()
         {
@@ -7898,14 +7909,9 @@ fn spawn_session_log(
         super::session_log::record(&task, trigger, &root, &result);
         match result {
             Ok(super::session_log::Outcome::Written { placed, .. }) => {
-                let shown = placed
-                    .path
-                    .strip_prefix(&root)
-                    .unwrap_or(&placed.path)
-                    .display()
-                    .to_string();
+                let shown = super::session_log::shown_path(&placed.path, &root);
                 let _ = sender.send(SessionEvent::Notice {
-                    message: format!("session log written to {shown}"),
+                    message: super::session_log::written_notice(trigger, &shown),
                 });
             }
             Ok(super::session_log::Outcome::Skipped(_)) => {}

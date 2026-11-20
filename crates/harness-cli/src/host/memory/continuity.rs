@@ -173,6 +173,13 @@ pub(super) fn owner_is_another_live_process(owner: &str) -> bool {
         })
 }
 
+/// Whether a pane or a run of this process holds `task` open.
+#[must_use]
+pub fn held_here(task: &TaskId) -> bool {
+    OPEN.lock()
+        .is_ok_and(|open| open.get(task.as_str()).is_some_and(|count| *count > 0))
+}
+
 /// Whether `task` is a conversation still open: held in this process, with a
 /// turn running here, or marked open or owed by another live ha process in
 /// one of the project stores this process has opened a conversation under.
@@ -180,11 +187,7 @@ pub(super) fn owner_is_another_live_process(owner: &str) -> bool {
 /// is always among them.
 #[must_use]
 pub fn is_live(task: &TaskId) -> bool {
-    if OPEN
-        .lock()
-        .is_ok_and(|open| open.get(task.as_str()).is_some_and(|count| *count > 0))
-        || super::session_log::turn_running_here(task)
-    {
+    if held_here(task) || super::session_log::turn_running_here(task) {
         return true;
     }
     let stores = STORES
