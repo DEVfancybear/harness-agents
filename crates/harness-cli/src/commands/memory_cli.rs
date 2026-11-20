@@ -57,7 +57,8 @@ enum MemorySubcommand {
     /// default), `show <id>...` (with its evidence and a diff against the
     /// entry as it is), `accept <id>...` (applied through the review's write
     /// path; refused as stale when the entry changed since), `reject
-    /// <id>...` (kept out, and not proposed again).
+    /// <id>...` (kept out, and not proposed again); `all` for an id decides
+    /// every change that waits.
     Queue(QueueArgs),
     /// Turn a flat memory file into the markdown store: the file is archived
     /// whole in memory/archive/, and an agent run (`ha exec`) splits it into

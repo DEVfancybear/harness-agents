@@ -911,7 +911,7 @@ pub struct Answer {
 }
 
 /// `ha memory queue` and `/memory queue`: `list` (the default), `show <id>`,
-/// `accept <id>...`, `reject <id>...`, over every queue under the data
+/// `accept <id>...|all`, `reject <id>...|all`, over every queue under the data
 /// directory `data`.
 #[must_use]
 pub fn command(data: &Path, words: &[&str]) -> Answer {
@@ -925,7 +925,7 @@ pub fn command(data: &Path, words: &[&str]) -> Answer {
         "reject" => decide(data, ids, false),
         other => Answer {
             lines: vec![format!(
-                "unknown memory queue action {other:?}: list, show <id>, accept <id>..., reject <id>..."
+                "unknown memory queue action {other:?}: list, show <id>, accept <id>...|all, reject <id>...|all"
             )],
             json: json!({"error": format!("unknown action {other}")}),
             ok: false,
@@ -962,7 +962,7 @@ fn list(data: &Path) -> Answer {
         ]
     } else {
         vec![format!(
-            "{} proposed memory change(s) wait for your review (each for {KEEP_DAYS} days); `show <id>` shows one with its evidence and diff, `accept <id>` applies it, `reject <id>` keeps it out:",
+            "{} proposed memory change(s) wait for your review (each for {KEEP_DAYS} days); `show <id>` shows one with its evidence and diff, `accept <id>` applies it, `reject <id>` keeps it out (`all` for every one):",
             items.len()
         )]
     };
@@ -1007,17 +1007,44 @@ fn show(data: &Path, ids: &[&str]) -> Answer {
 
 fn decide(data: &Path, ids: &[&str], accepting: bool) -> Answer {
     let verb = if accepting { "accept" } else { "reject" };
+    let key = if accepting { "accepted" } else { "rejected" };
     if ids.is_empty() {
         return Answer {
-            lines: vec![format!("{verb} <id>...: name the items")],
+            lines: vec![format!(
+                "{verb} <id>...|all: name the items, or all of them"
+            )],
             json: json!({"error": "no id"}),
             ok: false,
+        };
+    }
+    // `all`: every change that waits now, in the order the list shows them.
+    // One an earlier decision took out with it (a merge whose survivor was
+    // rejected) waits no more when its turn comes, and is passed over.
+    let everything = ids == ["all"];
+    let chosen = if everything {
+        all(data)
+            .into_iter()
+            .map(|located| located.item.id)
+            .collect::<Vec<_>>()
+    } else {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    };
+    if everything && chosen.is_empty() {
+        return Answer {
+            lines: vec![format!(
+                "The memory queue is empty: no proposed memory change waits to {verb}."
+            )],
+            json: json!({key: [], "refused": []}),
+            ok: true,
         };
     }
     let mut lines = Vec::new();
     let mut done = Vec::new();
     let mut refused = Vec::new();
-    for id in ids {
+    for id in chosen.iter().map(String::as_str) {
+        if everything && !all(data).iter().any(|located| located.item.id == id) {
+            continue;
+        }
         if accepting {
             match accept(data, id) {
                 Ok(Accepted::Applied(refinement)) => {
@@ -1049,7 +1076,7 @@ fn decide(data: &Path, ids: &[&str], accepting: bool) -> Answer {
             }
             continue;
         }
-        let located = all(data).into_iter().find(|located| located.item.id == *id);
+        let located = all(data).into_iter().find(|located| located.item.id == id);
         match located.map(|located| reject(&located.dir, id)) {
             Some(Ok((item, dropped))) => {
                 let with = if dropped.is_empty() {
@@ -1074,7 +1101,6 @@ fn decide(data: &Path, ids: &[&str], accepting: bool) -> Answer {
             }
         }
     }
-    let key = if accepting { "accepted" } else { "rejected" };
     Answer {
         ok: refused.is_empty(),
         lines,
@@ -1134,6 +1160,54 @@ mod tests {
             choices(data.path()).is_empty(),
             "a decided change waits no more"
         );
+    }
+
+    #[test]
+    fn all_decides_every_waiting_change_and_passes_over_one_gone_with_another() {
+        let data = tempfile::tempdir().expect("data");
+        let global = super::super::harness::global_dir(data.path());
+        std::fs::create_dir_all(&global).expect("dir");
+        let empty = command(data.path(), &["reject", "all"]);
+        assert!(empty.ok, "{:?}", empty.lines);
+        assert!(empty.lines[0].contains("empty"), "{:?}", empty.lines);
+        let survivor = item(edit(
+            "update",
+            "keep",
+            "Keep",
+            "what both entries said, merged into one",
+        ));
+        let mut merged = item(edit("delete", "gone", "", ""));
+        merged.after = Some(survivor.id.clone());
+        let other = item(edit(
+            "create",
+            "editor",
+            "Editor",
+            "The user edits in Helix with tabs of four",
+        ));
+        let mut queue = Queue {
+            items: vec![survivor.clone(), merged.clone(), other.clone()],
+            rejected: Vec::new(),
+        };
+        save(&global, &mut queue).expect("save");
+        assert_eq!(choices(data.path()).len(), 3);
+        let rejected = command(data.path(), &["reject", "all"]);
+        // The merge leaves with its survivor and is not refused as gone.
+        assert!(rejected.ok, "{:?}", rejected.lines);
+        assert_eq!(rejected.lines.len(), 2, "{:?}", rejected.lines);
+        assert!(
+            rejected.lines[0].contains(&merged.id),
+            "{:?}",
+            rejected.lines
+        );
+        assert!(
+            rejected.lines[1].starts_with(&format!("rejected {}", other.id)),
+            "{:?}",
+            rejected.lines
+        );
+        assert!(choices(data.path()).is_empty());
+        // `all` is the word alone: beside ids it is an id no change has.
+        let mixed = command(data.path(), &["accept", "all", &other.id]);
+        assert!(!mixed.ok, "{:?}", mixed.lines);
     }
 
     #[test]
