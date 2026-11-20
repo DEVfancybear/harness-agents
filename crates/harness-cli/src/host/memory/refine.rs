@@ -11770,7 +11770,10 @@ Run `node scripts/build.js`.
         let long_id = "an_entry_with_a_very_long_identifier_that_goes_on_and_on_and_on";
         let path = super::dream::page_path_for(&library, long_id).expect("path");
         assert!(
-            path.chars().count() <= 48 && path.ends_with(".md"),
+            path.chars().count() <= 48
+                && std::path::Path::new(&path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md")),
             "{path}"
         );
     }
