@@ -133,6 +133,15 @@ impl McpRequests {
         if server.bearer_token_env.is_some() {
             return None;
         }
+        // A key `/plugins` saved in the credential file.
+        if let Some(entry) = &server.bearer_token_credential {
+            return match super::credentials::load(self.auth.as_deref()?, entry) {
+                Ok(Some(super::credentials::Credential::ApiKey { key })) => {
+                    Some(key.trim().to_owned())
+                }
+                _ => None,
+            };
+        }
         let url = server.url.as_deref()?;
         super::mcp_oauth::bearer(self.auth.as_deref()?, name, url)
             .ok()
@@ -684,6 +693,39 @@ mod tests {
         let remote = config("remote").await;
         assert_eq!(remote["bearerTokenEnvVar"], "REMOTE_TOKEN");
         assert!(remote.get("headers").is_none(), "{remote}");
+    }
+
+    /// A catalog service connected from `/plugins` with an API key names the
+    /// saved key; the kernel gets it as the bearer, and nothing when the key
+    /// was removed.
+    #[tokio::test]
+    async fn a_server_with_a_saved_key_reaches_the_kernel_with_its_bearer() {
+        use super::McpRequests;
+        let temp = tempfile::tempdir().expect("temp");
+        let auth = temp.path().join("auth.json");
+        crate::interactive::credentials::save(
+            &auth,
+            "mcp-key:github",
+            &crate::interactive::credentials::Credential::api_key("fixture-pat"),
+        )
+        .expect("saved");
+        let mut servers = std::collections::BTreeMap::new();
+        servers.insert(
+            "github".to_owned(),
+            harness_types::McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: Some("https://api.githubcopilot.com/mcp/".to_owned()),
+                bearer_token_credential: Some("mcp-key:github".to_owned()),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        let host = McpRequests::new(servers, temp.path().to_path_buf()).with_auth(auth.clone());
+        let request = json!({"type": "mcp.config", "server": "github"});
+        let github = host.handle(&request).await.expect("known").expect("ok");
+        assert_eq!(github["headers"]["Authorization"], "Bearer fixture-pat");
+        crate::interactive::credentials::remove(&auth, "mcp-key:github").expect("removed");
+        let github = host.handle(&request).await.expect("known").expect("ok");
+        assert!(github.get("headers").is_none(), "{github}");
     }
 
     #[tokio::test]

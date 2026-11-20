@@ -754,6 +754,12 @@ pub struct McpServerConfigV2 {
     pub url: Option<String>,
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// The entry in ha's credential file (`auth.json`) whose saved key a
+    /// Streamable HTTP server sends as `Authorization: Bearer`, so the key is
+    /// never written in configuration. `/plugins` sets it for a catalog
+    /// service that needs an API key.
+    #[serde(default)]
+    pub bearer_token_credential: Option<String>,
     /// prime-agent's `enabled`: `false` keeps the server configured but does
     /// not start it. Omitted means enabled.
     #[serde(default)]
@@ -797,6 +803,7 @@ impl McpServerConfigV2 {
                 self.command.as_deref().is_none_or(str::is_empty)
                     || self.url.is_some()
                     || self.bearer_token_env.is_some()
+                    || self.bearer_token_credential.is_some()
                     || !self.headers.is_empty()
                     || !self.header_env.is_empty()
                     || self.args.len() > 64
@@ -829,6 +836,12 @@ impl McpServerConfigV2 {
                                 .chars()
                                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                     })
+                    || self
+                        .bearer_token_credential
+                        .as_deref()
+                        .is_some_and(|entry| {
+                            self.bearer_token_env.is_some() || !is_credential_entry(entry)
+                        })
                     || self.headers.len() + self.header_env.len() > 32
                     || self.headers.iter().any(|(header, value)| {
                         !is_header_name(header)
@@ -875,6 +888,16 @@ impl McpServerConfigV2 {
         }
         Ok(())
     }
+}
+
+/// A credential-file entry name such as `mcp-key:github`: 1-128 letters,
+/// numbers, `_`, `-`, `.` or `:`.
+fn is_credential_entry(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry.len() <= 128
+        && entry
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
 }
 
 fn is_header_name(name: &str) -> bool {

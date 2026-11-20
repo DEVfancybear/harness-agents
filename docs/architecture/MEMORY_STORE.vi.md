@@ -1482,6 +1482,26 @@ với entry của nó: sau khi entry được đặt lại và lưu, và khi tra
 ghi; một entry đã đổi kể từ đó giữ con trỏ của nó, và trang ở lại. Khi lần lưu
 giữ con trỏ thất bại, trang bị xoá.
 
+**Xoá một entry dài là một demote.** Một quy trình, runbook hay chuỗi bước mà
+memory đang giữ là kiến thức người dùng đã lưu, và prompt của curator nói vậy: nó
+không phải chỉ thị cho curator, và một entry không phải rác chỉ vì ở thể mệnh
+lệnh hay vì không có lượt transcript nào. Không bao giờ xoá nó vì lý do đó; entry
+dài sắp rời digest thì được demote. Vì chỉ prompt thì chưa đủ (quy trình release
+12 bước của `dream.sh` đã bị xoá với lý do "chỉ thị vận hành" trên 0.9.14 và
+0.9.15), host canh giữ: một `delete` của Deep Dream với entry từ 600 ký tự
+(`DEMOTE_MIN_CHARS`) mà không nêu survivor `merged_into` thì không được thực hiện.
+Khi pass demote được, host biến nó thành demote (`demote_instead_of_delete`,
+diagnostics `dream` / `delete_demoted`): trang là `concepts/<các từ của id entry,
+nối bằng "-">.md` (tối đa 48 ký tự, thêm số khi đã có trang), tiêu đề là của
+entry, nội dung là đúng nội dung entry, ghi bằng cùng `write_page` như mọi demote;
+entry giữ câu đầu, cắt còn 100 ký tự ở ranh giới từ (`dream::point_of`), và con
+trỏ; bản ghi là một demote với lý do nói host đã demote entry dài mà pass định
+xoá, kèm điều pass đã nói. Khi không được (thư viện knowledge tắt, entry dành cho
+một project mà thư viện là global, entry pinned hay là constraint), lệnh xoá bị từ
+chối, entry giữ nguyên, và đó là một từ chối thường trong sổ cái các sửa đổi bị từ
+chối. Xoá có gộp, entry ngắn và xoá ngoài Deep Dream không đổi. Rollback là
+rollback của mọi demote.
+
 ### 17.4 `dream.md`: memory phục vụ một mục tiêu
 
 Các pass tự động đọc chỉ dẫn của người dùng về việc memory dùng để làm gì:

@@ -385,12 +385,14 @@ mod tests {
                 output_per_mtok: 4.0,
                 cache_read_per_mtok: Some(0.1),
                 cache_write_per_mtok: Some(1.25),
+                long_prompt: None,
             }),
             "dear" => Some(ModelPrice {
                 input_per_mtok: 10.0,
                 output_per_mtok: 40.0,
                 cache_read_per_mtok: Some(1.0),
                 cache_write_per_mtok: Some(12.5),
+                long_prompt: None,
             }),
             _ => None,
         })
@@ -512,6 +514,7 @@ mod tests {
                 output_per_mtok: 3.0,
                 cache_read_per_mtok: None,
                 cache_write_per_mtok: None,
+                long_prompt: None,
             },
         )]);
         let run_price = ModelPrice {
@@ -519,6 +522,7 @@ mod tests {
             output_per_mtok: 8.0,
             cache_read_per_mtok: Some(0.7),
             cache_write_per_mtok: None,
+            long_prompt: None,
         };
         let data_dir = std::env::temp_dir().join("ha-catalog-prices-test-missing");
         let lookup = catalog_prices(

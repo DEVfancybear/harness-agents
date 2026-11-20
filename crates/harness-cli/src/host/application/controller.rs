@@ -374,6 +374,9 @@ pub struct InteractiveController {
     initial_goal: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
+    /// The catalog service (id, and what its key is called) whose API key
+    /// the masked prompt is collecting for `/plugins`.
+    plugin_key: Option<(String, String)>,
     /// Whose login the running `/login` or `/subagent-login` saves.
     login_scope: super::credentials::Scope,
     /// Reasoning received since the last committed row.
@@ -408,6 +411,10 @@ impl InteractiveController {
     /// `plain` selects how slash-command output is delivered: the plain renderer
     /// prints it as history lines, the TUI opens it as a modal overlay.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one initializer per controller field"
+    )]
     pub fn new(
         context: &LaunchContext,
         service: Box<dyn SessionPort>,
@@ -503,6 +510,7 @@ impl InteractiveController {
             initial_thinking: None,
             initial_goal: None,
             login_provider: None,
+            plugin_key: None,
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
             pending_thinking: String::new(),
@@ -1855,6 +1863,10 @@ impl InteractiveController {
             InputOutcome::Exit => self.command("/exit"),
             InputOutcome::Interrupt => self.interrupt(),
             InputOutcome::Submit(text) => self.submit(text),
+            InputOutcome::Secret(value) if self.plugin_key.is_some() => {
+                self.save_plugin_key(&value)
+            }
+            InputOutcome::SecretCanceled if self.plugin_key.is_some() => self.cancel_plugin_key(),
             InputOutcome::Secret(value) => self.save_key(&value),
             InputOutcome::SecretCanceled => self.cancel_key(),
         }
@@ -2234,6 +2246,33 @@ impl InteractiveController {
     }
 
     fn connect_plugin(&mut self, id: &str, effects: &mut Vec<Effect>) {
+        // A service that connects with an API key asks for it in the masked
+        // prompt; the value goes to the credential file and nowhere else.
+        if let Some(key_name) = self.service.plugin_key_prompt(id) {
+            if self.phase.has_active_run() {
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "cannot ask for the {key_name} while a run is active; cancel it first"
+                        ),
+                    },
+                );
+                return;
+            }
+            self.login_provider = None;
+            self.editor.begin_secret_entry();
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "Enter the {key_name} for {id}: it is masked, never kept in history, and saved to the credential file. Esc cancels."
+                    ),
+                },
+            );
+            self.plugin_key = Some((id.to_owned(), key_name));
+            return;
+        }
         match self.service.connect_plugin(id) {
             Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
             Err(message) => self.push_history(effects, HistoryItem::Error { message }),
@@ -5857,6 +5896,38 @@ impl InteractiveController {
         effects
     }
 
+    /// `/plugins` collected a service's API key: save it and add the server.
+    /// The value is never pushed to history or rendered; only the outcome is.
+    fn save_plugin_key(&mut self, value: &str) -> Vec<Effect> {
+        let Some((id, _)) = self.plugin_key.take() else {
+            return vec![Effect::Redraw];
+        };
+        let mut effects = Vec::new();
+        let item = match self.service.connect_plugin_with_key(&id, value) {
+            Ok(message) => HistoryItem::Notice { message },
+            Err(message) => HistoryItem::Error { message },
+        };
+        self.push_history(&mut effects, item);
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// Esc left the `/plugins` key prompt.
+    fn cancel_plugin_key(&mut self) -> Vec<Effect> {
+        let Some((id, key_name)) = self.plugin_key.take() else {
+            return vec![Effect::Redraw];
+        };
+        let mut effects = Vec::new();
+        self.push_history(
+            &mut effects,
+            HistoryItem::Notice {
+                message: format!("{key_name} entry for {id} canceled; nothing was saved."),
+            },
+        );
+        effects.push(Effect::Redraw);
+        effects
+    }
+
     /// Save an API key entered in the app, then make it effective at once.
     ///
     /// The value is written to the credential file and nowhere else: it is not
@@ -6050,6 +6121,8 @@ impl InteractiveController {
             );
             return;
         }
+        // A `/login` key prompt replaces a `/plugins` one.
+        self.plugin_key = None;
         let for_subagents = self.login_scope == super::credentials::Scope::Subagent;
         // prime-agent's "Serper (web search)" entry: the key web_search and
         // the websearch skill read, kept in the credential file.
@@ -7984,6 +8057,116 @@ mod tests {
             crate::interactive::credentials::remove(&path, provider)
                 .map_err(|error| error.to_string())
         }
+    }
+
+    /// Test port for `/plugins`: GitHub connects with a key, Linear signs in.
+    #[derive(Clone, Default)]
+    struct PluginKeyPort {
+        recorded: RecordingPort,
+        keys: Arc<Mutex<Vec<(String, String)>>>,
+        oauth: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SessionPort for PluginKeyPort {
+        fn label(&self) -> String {
+            self.recorded.label()
+        }
+        fn submit(&mut self, request: SubmitRequest) {
+            self.recorded.submit(request);
+        }
+        fn cancel(&mut self) {
+            self.recorded.cancel();
+        }
+        fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+            self.recorded.answer(request_id, decision)
+        }
+        fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+            self.recorded.resume(session_id)
+        }
+        fn limits(&self) -> TurnBounds {
+            self.recorded.limits()
+        }
+        fn plugin_key_prompt(&self, id: &str) -> Option<String> {
+            (id == "github").then(|| "GITHUB_PAT_TOKEN".to_owned())
+        }
+        fn connect_plugin(&mut self, id: &str) -> Result<String, String> {
+            self.oauth.lock().expect("oauth").push(id.to_owned());
+            Ok(format!("Connecting {id}"))
+        }
+        fn connect_plugin_with_key(&mut self, id: &str, key: &str) -> Result<String, String> {
+            self.keys
+                .lock()
+                .expect("keys")
+                .push((id.to_owned(), key.to_owned()));
+            Ok("Connected GitHub".to_owned())
+        }
+    }
+
+    /// Seen while testing the app: `/plugins connect github` refused with
+    /// "it needs an API key; add it with /mcp add". It now asks for the token
+    /// in the masked prompt; the value reaches the service and never the
+    /// transcript or the input history, and Esc saves nothing.
+    #[test]
+    fn plugins_connect_asks_for_an_api_key_in_the_masked_prompt() {
+        let (_temp, context) = context(true);
+        let port = PluginKeyPort::default();
+        let keys = Arc::clone(&port.keys);
+        let oauth = Arc::clone(&port.oauth);
+        let mut controller =
+            InteractiveController::new(&context, Box::new(port), SessionChannel::new(), true);
+        controller.boot_lines();
+
+        let effects = submit_text(&mut controller, "/plugins connect github");
+        assert!(controller.editor.secret_entry(), "a key service asks");
+        let asked = effects_to_plain(&effects).join("\n");
+        assert!(
+            asked.contains("Enter the GITHUB_PAT_TOKEN for github"),
+            "{asked}"
+        );
+        type_text(&mut controller, "ghp_secretFixture");
+        assert!(
+            !controller.prompt().contains("ghp_secretFixture"),
+            "the prompt is masked"
+        );
+        let effects = controller.handle_key(Key::Enter);
+        assert!(!controller.editor.secret_entry());
+        assert_eq!(
+            keys.lock().expect("keys").as_slice(),
+            [("github".to_owned(), "ghp_secretFixture".to_owned())]
+        );
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("Connected GitHub")
+        );
+        assert!(
+            !controller.transcript().join("\n").contains("ghp_secret"),
+            "{:?}",
+            controller.transcript()
+        );
+        let _ = controller.handle_key(Key::Up);
+        assert!(
+            !controller.prompt().contains("ghp_secret"),
+            "Up must never recall a key"
+        );
+        let _ = controller.handle_key(Key::EraseToLineStart);
+
+        submit_text(&mut controller, "/plugins connect github");
+        type_text(&mut controller, "ghp_abandoned");
+        let effects = controller.handle_key(Key::Esc);
+        assert!(!controller.editor.secret_entry(), "Esc cancels entry");
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("GITHUB_PAT_TOKEN entry for github canceled; nothing was saved"),
+            "{effects:?}"
+        );
+        assert_eq!(keys.lock().expect("keys").len(), 1, "Esc saves nothing");
+
+        // An OAuth service still signs in, without a prompt.
+        submit_text(&mut controller, "/plugins connect linear");
+        assert!(!controller.editor.secret_entry());
+        assert_eq!(oauth.lock().expect("oauth").as_slice(), ["linear"]);
     }
 
     struct Bench {
