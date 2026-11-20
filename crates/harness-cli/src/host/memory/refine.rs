@@ -11868,13 +11868,44 @@ Run `node scripts/build.js`.
             "{}",
             result.record
         );
+        // The pass drops a delete of a pinned entry that no pinned entry
+        // keeps before the host's demote is reached: nothing is applied and
+        // no page is written.
         assert!(
-            result.record["appliedEdits"][0]["error"]
+            result.record["rationale"]
                 .as_str()
-                .is_some_and(|error| error.contains("read whole in every turn")),
+                .is_some_and(|rationale| rationale.contains("deleting pinned release")),
             "{}",
             result.record
         );
+        assert!(
+            result.record["appliedEdits"]
+                .as_array()
+                .is_some_and(|edits| edits.iter().all(|edit| edit["action"] != "demote")),
+            "{}",
+            result.record
+        );
+        // Asked directly, the host refuses to move a pinned entry down too.
+        let before = json!({"id": "release", "kind": "memory", "title": "Release procedure", "content": steps, "metadata": {"pinned": true}});
+        let batch = super::Batch {
+            library: Some(super::dream::Library {
+                root: directory.path().join("knowledge"),
+                level: "global",
+                in_checkout: false,
+            }),
+            ..super::Batch::default()
+        };
+        let mut delete = super::Edit(
+            json!({"action": "delete", "kind": "memory", "id": "release", "reason": "x"})
+                .as_object()
+                .expect("edit")
+                .clone(),
+        );
+        assert!(
+            super::demote_instead_of_delete(&mut delete, &before, &batch, false)
+                .is_some_and(|error| error.contains("read whole in every turn"))
+        );
+        assert_eq!(delete.text("action"), Some("delete"));
     }
 
     /// The rollback of the host's demote is the rollback of any demote: the
