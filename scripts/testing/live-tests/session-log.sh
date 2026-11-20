@@ -211,4 +211,42 @@ check "an abandoned task is not offered a fourth time" '[ -n "$RW4" ] && ! offer
 check "the earlier conversations were shown it three times, as counted" '[ -n "$ZSTATE" ] && [ "$(tr -cd , < "$(dirname "$ZSTATE")/task_state.offered.json" 2>/dev/null | wc -c)" -eq 2 ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
+# Section 11 fails on 0.9.14 (bug report 20261120-135928): a turn starting in
+# a second pane wrote the log of the conversation open, idle, in the first
+# pane of the same worker, as a log a crash had left, and told the second pane.
+echo "################ 11. a conversation open in another pane keeps its log until it is left"
+V=$RX/v
+project "$V"
+touch "$RX/v.stamp"
+HA_IDLE_REVIEW_SECONDS=3600 agent "$V" v1
+say v1 "Ghi nhớ: máy chủ build của dự án này tên là kestrel. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+say v1 "Việc còn lại: viết script deploy lên máy chủ build đó. Chưa làm, chỉ ghi nhận. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+VOWEDF=$(find "$D"/projects/*/session-log/owed -type f -newer "$RX/v.stamp" 2>/dev/null | head -1); VOWED=$(basename "${VOWEDF:-}" 2>/dev/null)
+check "precondition: the first pane's conversation owes its log and none is written" '[ -n "$VOWED" ] && [ -z "$(ls "$V"/.harness/sessions/*.md 2>/dev/null)" ]'
+HA_IDLE_REVIEW_SECONDS=3600 agent "$V" v2
+say v2 "Trả lời đúng một từ: cam" > "$RX/v2.out" 2>&1
+# The 0.9.14 write took nine seconds beside the turn.
+wait_for "$V/.harness/sessions/*.md" 60
+check "a turn in the second pane writes no log of the conversation open in the first" '[ -n "$VOWED" ] && ! grep -qs "Conversation:\*\* $VOWED" "$V"/.harness/sessions/*.md'
+check "which still owes it" '[ -n "$VOWEDF" ] && [ -e "$VOWEDF" ]'
+# How many times the log of conversation $1 was recorded written: the record
+# comes with the write, whenever the notice of it reaches a pane.
+written() { "$PY" - "$D/diagnostics" "$1" <<'EOF'
+import glob, json, os, sys
+n = 0
+for path in glob.glob(os.path.join(sys.argv[1], "*.jsonl")):
+    for line in open(path, encoding="utf-8"):
+        r = json.loads(line)
+        n += r.get("kind") == "session_log" and r.get("event") == "written" and r.get("task") == sys.argv[2]
+print(n)
+EOF
+}
+check "and no write of it was recorded" '[ -n "$VOWED" ] && [ "$(written "$VOWED" | tr -d "\r")" -eq 0 ]'
+"$HA" send v1 "/new -- Trả lời đúng một từ: xong" --wait > "$RX/v1-new.out" 2>&1
+wait_for "$V/.harness/sessions/*.md" 120; sleep 2
+VLOG=$(grep -ls "Conversation:\*\* $VOWED" "$V"/.harness/sessions/*.md | head -1)
+check "left, the first pane's conversation gets its log" '[ -n "$VLOG" ] && grep -qi "kestrel" "$VLOG"'
+check "and owes it no more" '[ -n "$VOWEDF" ] && [ ! -e "$VOWEDF" ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
 result

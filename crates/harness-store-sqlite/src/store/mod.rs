@@ -5653,9 +5653,12 @@ const BUG_REPORT_TABLES: &[(&str, &str, &str)] = &[
         "SELECT run_id, session_id, task_id, input_id, state, acceptance, stop_reason, awaiting_question_id FROM runs ORDER BY rowid DESC LIMIT 300",
         "",
     ),
+    // A step names its run only; its run's conversation and session come
+    // with it, so a report of one conversation keeps that one's steps (bug
+    // report 20261120-135928 held 28 steps, 4 of them its conversation's).
     (
         "run_steps",
-        "SELECT step_id, run_id, step_index, request_id, state, stop_reason FROM run_steps ORDER BY rowid DESC LIMIT 600",
+        "SELECT run_steps.step_id AS step_id, run_steps.run_id AS run_id, run_steps.step_index AS step_index, run_steps.request_id AS request_id, run_steps.state AS state, run_steps.stop_reason AS stop_reason, runs.session_id AS session_id, runs.task_id AS task_id FROM run_steps LEFT JOIN runs ON runs.run_id = run_steps.run_id ORDER BY run_steps.rowid DESC LIMIT 600",
         "",
     ),
     (
@@ -5954,6 +5957,75 @@ mod per_session_index_tests {
                 "{read} scans its table: {details:?}"
             );
         }
+        store.close().await.expect("close store");
+    }
+
+    /// Bug report 20261120-135928: a report of one conversation held 28 run
+    /// steps, 4 of them its own - a step names only its run, so no filter by
+    /// conversation could keep it or leave it out. Each step now comes with
+    /// its run's conversation and session.
+    #[tokio::test]
+    async fn a_reported_step_names_its_runs_conversation() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        for (run, task) in [("run-a", "task-a"), ("run-b", "task-b")] {
+            sqlx::query("INSERT INTO runs (run_id, session_id, task_id, input_id, state, owner_generation, revision) VALUES (?, ?, ?, ?, 'completed', 1, 1)")
+                .bind(run)
+                .bind(format!("session-of-{run}"))
+                .bind(task)
+                .bind(format!("input-of-{run}"))
+                .execute(&store.pool)
+                .await
+                .expect("run");
+            sqlx::query("INSERT INTO run_steps (step_id, run_id, step_index, request_id, packet_id, manifest_hash, source_sequence, state) VALUES (?, ?, 0, ?, 'packet', 'hash', 1, 'streamed')")
+                .bind(format!("step-of-{run}"))
+                .bind(run)
+                .bind(format!("request-of-{run}"))
+                .execute(&store.pool)
+                .await
+                .expect("step");
+        }
+        let tables = store.bug_report_tables(false).await;
+        let steps = &tables["run_steps"];
+        let columns = steps["columns"].as_array().expect("columns");
+        let at = |name: &str| {
+            columns
+                .iter()
+                .position(|column| column == name)
+                .unwrap_or_else(|| panic!("no {name} column in {columns:?}"))
+        };
+        let (step, task, session) = (at("step_id"), at("task_id"), at("session_id"));
+        let mut rows = steps["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                (
+                    row[step].as_str().unwrap_or_default().to_owned(),
+                    row[task].as_str().unwrap_or_default().to_owned(),
+                    row[session].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "step-of-run-a".into(),
+                    "task-a".into(),
+                    "session-of-run-a".into()
+                ),
+                (
+                    "step-of-run-b".into(),
+                    "task-b".into(),
+                    "session-of-run-b".into()
+                ),
+            ]
+        );
         store.close().await.expect("close store");
     }
 

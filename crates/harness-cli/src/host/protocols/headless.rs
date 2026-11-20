@@ -1824,10 +1824,12 @@ pub async fn run_with(
             waited = logged => if let Ok(result) = waited {
                 super::session_log::record(&outcome.task_id, "exit", root, &result);
                 match result {
-                    Ok(super::session_log::Outcome::Written { placed, .. }) => out.stderr(&format!(
-                        "session log written to {}",
-                        placed.path.strip_prefix(root).unwrap_or(&placed.path).display()
-                    )),
+                    Ok(super::session_log::Outcome::Written { placed, .. }) => out.stderr(
+                        &super::session_log::written_notice(
+                            "exit",
+                            &super::session_log::shown_path(&placed.path, root),
+                        ),
+                    ),
                     Err(error) => out.stderr(&format!("the session log was not written: {error}")),
                     Ok(super::session_log::Outcome::Skipped(_)) => {}
                 }

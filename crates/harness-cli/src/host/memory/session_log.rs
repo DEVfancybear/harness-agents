@@ -410,8 +410,12 @@ pub fn owed(marks: &Path, except: Option<&TaskId>) -> Vec<(TaskId, SessionId)> {
             let task = TaskId::parse(entry.file_name().to_str()?.to_owned()).ok()?;
             let mark = Mark::read(&entry.path())?;
             let due = mark.retry_after.is_none_or(|after| now >= after);
-            let mine =
-                except.is_none_or(|except| *except != task) && !running.contains(task.as_str());
+            // Not one a pane of this process holds open, idle between turns:
+            // a turn starting in another pane wrote such a log as one a crash
+            // had left, and told that other pane (bug report 20261120-135928).
+            let mine = except.is_none_or(|except| *except != task)
+                && !running.contains(task.as_str())
+                && !super::continuity::held_here(&task);
             (due && mine && !mark.owned_elsewhere())
                 .then_some((task, SessionId::parse(mark.session).ok()?))
         })
@@ -1508,6 +1512,29 @@ pub enum Outcome {
     Skipped(&'static str),
 }
 
+/// Where a log was written, as the person and the records are told: under
+/// `root` when it is, with `/` between the parts. A notice read
+/// `.harness/sessions\2026-11-20-13_58-rust-line-count.md` (bug report
+/// 20261120-135928).
+#[must_use]
+pub fn shown_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// What the person is told of a log written: a log another conversation
+/// owed, written beside this one's turn, says it is not this conversation's.
+#[must_use]
+pub fn written_notice(trigger: &str, shown: &str) -> String {
+    if trigger == "owed" {
+        format!("the session log another conversation owed was written to {shown}")
+    } else {
+        format!("session log written to {shown}")
+    }
+}
+
 /// The diagnostics record of one log decision, which the bug report reads:
 /// kind `session_log`, event `written` (trigger, home, path, bytes, turns),
 /// `skipped` (trigger, reason) or `failed` (warn; the error, redacted and
@@ -1515,12 +1542,7 @@ pub enum Outcome {
 pub fn record(task: &TaskId, trigger: &'static str, root: &Path, result: &Result<Outcome, String>) {
     match result {
         Ok(Outcome::Written { placed, turns }) => {
-            let path = placed
-                .path
-                .strip_prefix(root)
-                .unwrap_or(&placed.path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let path = shown_path(&placed.path, root);
             let mut builder = harness_types::diag::info("session_log", "written")
                 .task(task.as_str())
                 .field("trigger", trigger)
@@ -2440,6 +2462,32 @@ mod tests {
         DateTime::parse_from_rfc3339(text).expect("time")
     }
 
+    /// Bug report 20261120-135928: a turn's pane read "session log written
+    /// to .harness/sessions\2026-11-20-13_58-rust-line-count.md" for another
+    /// conversation's log - two separators in one path, and nothing saying
+    /// the log was not the pane's own.
+    #[test]
+    fn a_written_log_is_shown_with_one_separator_and_whose_it_is() {
+        let root = Path::new("project");
+        let path = root
+            .join(".harness/sessions")
+            .join("2026-11-20-13_58-rust-line-count.md");
+        let shown = shown_path(&path, root);
+        assert_eq!(
+            shown,
+            ".harness/sessions/2026-11-20-13_58-rust-line-count.md"
+        );
+        assert_eq!(
+            written_notice("quiet", &shown),
+            format!("session log written to {shown}")
+        );
+        let owed = written_notice("owed", &shown);
+        assert!(
+            owed.contains("another conversation") && owed.ends_with(&shown),
+            "{owed}"
+        );
+    }
+
     fn draft() -> Draft {
         Draft::parse(MODEL_LOG).expect("a log")
     }
@@ -3255,6 +3303,22 @@ mod tests {
                 "a turn half done is not logged"
             );
         }
+        // Bug report 20261120-135928: another pane of this process kept the
+        // conversation open, idle, and a turn starting in a second pane wrote
+        // its log as one a crash had left, and told the second pane. A
+        // conversation a pane holds open is still somebody's work.
+        {
+            let _open = super::super::continuity::OpenConversation::hold(&marks, &task);
+            assert!(
+                owed(&marks, None).is_empty(),
+                "a conversation another pane holds open is not logged"
+            );
+        }
+        assert_eq!(
+            owed(&marks, None),
+            [(task.clone(), second.clone())],
+            "let go of, it is owed again"
+        );
 
         // The process was killed before it wrote the log. The next start
         // finds what is owed and writes it.
