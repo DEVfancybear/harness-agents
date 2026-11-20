@@ -751,7 +751,7 @@ mod tests {
     }
 
     /// The Claude 5.5 models and Fable 5.2, with Anthropic's prices (input,
-    /// output, cache read, cache write per MTok), 1M context, 128K output and
+    /// output, cache read, cache write per million tokens), 1M context, 128K output and
     /// the thinking levels each one takes.
     #[test]
     fn the_snapshot_has_the_claude_5_5_models_and_fable_5_2() {

@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(calculate_cost(None, Usage::default()), None);
     }
 
-    /// Claude Haiku 5.5 has two rate cards: $0.10 / $0.50 per MTok for a prompt
+    /// Claude Haiku 5.5 has two rate cards: $0.10 / $0.50 per million tokens for a prompt
     /// of 100K tokens or fewer, $0.50 / $2.50 for every token of a longer one,
     /// cache reads at a tenth of the input rate and writes at 1.25 times it.
     #[test]
