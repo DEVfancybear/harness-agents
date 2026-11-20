@@ -6015,7 +6015,7 @@ impl SessionPort for AgentSessionService {
                 Ok(super::memory_queue::command(&self.data_dir, &words).lines)
             }
             Some((other, _)) => Err(format!(
-                "/memory {other}: unknown; /memory [queue] [list|show <id>|accept <id>...|reject <id>...]"
+                "/memory {other}: unknown; /memory [queue] [list|show <id>|accept <id>...|all|reject <id>...|all]"
             )),
         }
     }
@@ -6104,14 +6104,17 @@ impl SessionPort for AgentSessionService {
         }
         super::packages::set_offline(super::offline::is_offline(&self.environment));
         let sender = self.sender.clone();
+        // Worded as the manager words the step it starts, which it then
+        // reports again: the app says it once.
         let started = match &action {
-            Action::Install { source, .. } => format!("installing {source}..."),
-            Action::Remove { source, .. } => format!("removing {source}..."),
+            Action::Install { source, .. } => format!("Installing {source}..."),
+            Action::Remove { source, .. } => format!("Removing {source}..."),
             Action::Update {
                 source: Some(source),
-            } => format!("updating {source}..."),
-            Action::Update { source: None } | Action::List => "updating packages...".to_owned(),
+            } => format!("Updating {source}..."),
+            Action::Update { source: None } | Action::List => "Updating packages...".to_owned(),
         };
+        let said = started.clone();
         let running = Running;
         let spawned = std::thread::Builder::new()
             .name("ha-package".to_owned())
@@ -6122,7 +6125,9 @@ impl SessionPort for AgentSessionService {
                 };
                 let progress = notice.clone();
                 let mut manager = command::manager(&workspace, &agent_dir, move |step| {
-                    progress(step.to_owned());
+                    if step != said {
+                        progress(step.to_owned());
+                    }
                 });
                 let outcome = command::run(&mut manager, &action);
                 drop(running);
@@ -14816,7 +14821,7 @@ mod tests {
             service
                 .package(&["install".to_owned(), source.clone()])
                 .expect("install starts"),
-            [format!("installing {source}...")]
+            [format!("Installing {source}...")]
         );
         settle(&format!("Installed {source}"), &mut notices).await;
         let listed = service.package(&["list".to_owned()]).expect("list");
@@ -14852,6 +14857,8 @@ mod tests {
             .package(&["remove".to_owned(), named.clone()])
             .expect("removal starts");
         settle(&format!("Removed {named}"), &mut notices).await;
+        // The steps the app said it started are not said again.
+        assert!(notices.iter().all(|n| !n.ends_with("...")), "{notices:?}");
         assert!(offered(&service).is_empty());
         assert!(
             !service

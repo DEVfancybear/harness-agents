@@ -10327,8 +10327,14 @@ Run `node scripts/build.js`.
             "{:?}",
             shown.lines
         );
-        let accepted = memory_queue::command(data, &["accept", &queued]);
+        // `all` accepts every change that waits: here the one.
+        let accepted = memory_queue::command(data, &["accept", "all"]);
         assert!(accepted.ok, "{:?}", accepted.lines);
+        assert!(
+            accepted.lines[0].starts_with(&format!("accepted {queued}")),
+            "{:?}",
+            accepted.lines
+        );
         let entry = &load_raw(&scopes.global)["entries"]["memory"]["release_sign_off"];
         assert_eq!(entry["path"], "constraints", "{entry}");
         assert_eq!(entry["origin"]["kind"], "user", "{entry}");
