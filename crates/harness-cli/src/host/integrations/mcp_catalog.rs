@@ -46,6 +46,15 @@ pub struct Service {
     pub ready: bool,
     pub setup_reason: Option<String>,
     pub metadata_reviewed: bool,
+    /// For an `api_key` service whose setup asks for a bearer token: the name
+    /// the catalog gives that token (`GITHUB_PAT_TOKEN`), shown in the prompt.
+    pub bearer_key: Option<String>,
+}
+
+/// The credential-file entry a catalog service's API key is saved under.
+#[must_use]
+pub fn key_credential(server: &str) -> String {
+    format!("mcp-key:{server}")
 }
 
 impl Service {
@@ -99,6 +108,7 @@ impl Service {
                 .pointer("/verification/status")
                 .and_then(Value::as_str)
                 == Some("metadata-reviewed"),
+            bearer_key: bearer_key(entry),
         })
     }
 
@@ -109,6 +119,40 @@ impl Service {
         self.ready
             && matches!(self.auth.as_str(), "oauth" | "unknown")
             && self.url.as_deref().is_some_and(concrete_endpoint)
+    }
+
+    /// An `api_key` service `/plugins` can connect by asking for the key: a
+    /// concrete https endpoint whose setup is one bearer token. Its catalog
+    /// setup status is `requires-setup` because of that token, so readiness
+    /// is not asked for.
+    #[must_use]
+    pub fn key_connectable(&self) -> bool {
+        self.auth == "api_key"
+            && self.bearer_key.is_some()
+            && self.url.as_deref().is_some_and(concrete_endpoint)
+    }
+}
+
+/// The token an `api_key` entry's setup asks for, when it asks for a bearer
+/// token (`setup.requirement` or a field of kind `bearer-token`).
+fn bearer_key(entry: &Value) -> Option<String> {
+    let setup = entry.get("setup")?;
+    let fields = setup
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let field = fields
+        .iter()
+        .find(|field| field.get("kind").and_then(Value::as_str) == Some("bearer-token"));
+    let label = field
+        .and_then(|field| field.get("label").or_else(|| field.get("id")))
+        .and_then(Value::as_str)
+        .filter(|label| !label.is_empty());
+    match (label, setup.get("requirement").and_then(Value::as_str)) {
+        (Some(label), _) => Some(label.to_owned()),
+        (None, Some("bearer-token")) => Some("API key".to_owned()),
+        _ => None,
     }
 }
 
@@ -240,6 +284,8 @@ pub fn refresh_in_background(data_dir: &Path) {
 pub struct Connections<'a> {
     pub servers: &'a BTreeMap<String, McpServerConfigV2>,
     pub signed_in: &'a dyn Fn(&str, &str) -> bool,
+    /// Whether the credential file holds a key under this entry.
+    pub has_key: &'a dyn Fn(&str) -> bool,
 }
 
 /// prime-agent's `build_plugin_views`: one card per catalog service, then
@@ -280,7 +326,21 @@ fn catalog_card(service: &Service, connections: &Connections<'_>) -> Value {
         configured
     {
         let url = server.url.clone().unwrap_or_default();
-        if uses_oauth
+        if let Some(entry) = &server.bearer_token_credential {
+            // A key saved from `/plugins`: connected while the key is there.
+            if (connections.has_key)(entry) {
+                ("connected", vec![service.id.clone()], None)
+            } else {
+                (
+                    "not_connected",
+                    Vec::new(),
+                    Some(format!(
+                        "The saved key is missing; connect again with /plugins connect {}.",
+                        service.id
+                    )),
+                )
+            }
+        } else if uses_oauth
             && server.bearer_token_env.is_none()
             && !(connections.signed_in)(&service.id, &url)
         {
@@ -293,7 +353,12 @@ fn catalog_card(service: &Service, connections: &Connections<'_>) -> Value {
             ("pending", vec![service.id.clone()], None)
         }
     } else {
-        let hint = if !service.ready {
+        let hint = if service.key_connectable() {
+            Some(format!(
+                "Connect asks for the {} (masked, saved in the credential file).",
+                service.bearer_key.as_deref().unwrap_or("API key")
+            ))
+        } else if !service.ready {
             Some(service.setup_reason.clone().unwrap_or_else(|| {
                 "This service requires manual setup before it can be connected.".to_owned()
             }))
@@ -321,8 +386,8 @@ fn catalog_card(service: &Service, connections: &Connections<'_>) -> Value {
         "serviceId": service.id,
         "label": service.label,
         "connectionStatus": status,
-        "connectable": service.connectable(),
-        "addAccountAllowed": service.connectable(),
+        "connectable": service.connectable() || service.key_connectable(),
+        "addAccountAllowed": service.connectable() || service.key_connectable(),
         "usesOauth": uses_oauth,
         "source": "catalog",
         "connectionIds": connection_ids,
@@ -432,10 +497,16 @@ pub fn session_cards(
     auth_path: &Path,
 ) -> Vec<Value> {
     let auth_path: PathBuf = auth_path.to_path_buf();
-    let signed_in = move |server: &str, url: &str| {
+    let signed_in = |server: &str, url: &str| {
         matches!(
             super::credentials::load(&auth_path, &super::mcp_oauth::credential_key(server)),
             Ok(Some(super::credentials::Credential::McpOauth { endpoint, .. })) if endpoint == url
+        )
+    };
+    let has_key = |entry: &str| {
+        matches!(
+            super::credentials::load(&auth_path, entry),
+            Ok(Some(super::credentials::Credential::ApiKey { .. }))
         )
     };
     views(
@@ -443,6 +514,7 @@ pub fn session_cards(
         &Connections {
             servers,
             signed_in: &signed_in,
+            has_key: &has_key,
         },
     )
 }
@@ -452,6 +524,10 @@ mod tests {
     use super::*;
 
     fn no_sign_in(_: &str, _: &str) -> bool {
+        false
+    }
+
+    fn no_key(_: &str) -> bool {
         false
     }
 
@@ -478,6 +554,7 @@ mod tests {
             &Connections {
                 servers: &servers,
                 signed_in: &no_sign_in,
+                has_key: &no_key,
             },
         );
         let first = page(&cards, None, None, 50).expect("page");
@@ -507,10 +584,101 @@ mod tests {
             &Connections {
                 servers: &servers,
                 signed_in: &signed_in,
+                has_key: &no_key,
             },
         );
         assert_eq!(cards[0]["connectionStatus"], json!("pending"));
         assert_eq!(cards[0]["connectionIds"], json!(["linear"]));
         assert_eq!(cards[1]["connectionStatus"], json!("not_connected"));
+    }
+
+    /// The bundled catalog's GitHub needs a personal access token: `/plugins`
+    /// can connect it by asking for the key, and once a server names the
+    /// saved key the card is connected.
+    #[test]
+    fn an_api_key_service_is_connectable_and_connected_by_its_saved_key() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let services = load(temporary.path(), temporary.path());
+        let github = services
+            .iter()
+            .find(|service| service.id == "github")
+            .expect("github in the bundled catalog");
+        assert_eq!(github.auth, "api_key");
+        assert!(!github.connectable(), "no OAuth sign-in for a PAT service");
+        assert!(github.key_connectable());
+        assert_eq!(github.bearer_key.as_deref(), Some("GITHUB_PAT_TOKEN"));
+        let only = std::slice::from_ref(github);
+        let servers = BTreeMap::new();
+        let cards = views(
+            only,
+            &Connections {
+                servers: &servers,
+                signed_in: &no_sign_in,
+                has_key: &no_key,
+            },
+        );
+        assert_eq!(cards[0]["connectionStatus"], json!("setup_required"));
+        assert_eq!(cards[0]["connectable"], json!(true));
+        assert!(
+            cards[0]["setupHint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("GITHUB_PAT_TOKEN")),
+            "{}",
+            cards[0]
+        );
+
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "github".to_owned(),
+            McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: github.url.clone(),
+                bearer_token_credential: Some(key_credential("github")),
+                ..McpServerConfigV2::default()
+            },
+        );
+        let saved = |entry: &str| entry == "mcp-key:github";
+        let cards = views(
+            only,
+            &Connections {
+                servers: &servers,
+                signed_in: &no_sign_in,
+                has_key: &saved,
+            },
+        );
+        assert_eq!(cards[0]["connectionStatus"], json!("connected"));
+        assert_eq!(cards[0]["connectionIds"], json!(["github"]));
+        let cards = views(
+            only,
+            &Connections {
+                servers: &servers,
+                signed_in: &no_sign_in,
+                has_key: &no_key,
+            },
+        );
+        assert_eq!(cards[0]["connectionStatus"], json!("not_connected"));
+    }
+
+    /// An `api_key` service without a bearer-token setup, or without a
+    /// concrete endpoint, still needs `/mcp add`.
+    #[test]
+    fn an_api_key_service_without_a_bearer_token_is_not_key_connectable() {
+        let entry = json!({
+            "server": "custom", "label": "Custom",
+            "transport": { "type": "http", "url": "https://example.test/mcp" },
+            "auth": { "strategy": "api_key" },
+            "setup": { "status": "requires-setup", "fields": [ { "id": "X", "kind": "header" } ] }
+        });
+        let service = Service::parse(&entry).expect("parsed");
+        assert!(!service.key_connectable());
+        let templated = json!({
+            "server": "tenant", "label": "Tenant",
+            "transport": { "type": "http", "url": "https://{tenant}.example.test/mcp" },
+            "auth": { "strategy": "api_key" },
+            "setup": { "status": "requires-setup", "requirement": "bearer-token" }
+        });
+        let service = Service::parse(&templated).expect("parsed");
+        assert_eq!(service.bearer_key.as_deref(), Some("API key"));
+        assert!(!service.key_connectable());
     }
 }

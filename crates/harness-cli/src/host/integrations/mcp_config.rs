@@ -144,32 +144,7 @@ pub fn run(
         Some("add") if args.len() == 1 => Err(USAGE.join("\n")),
         Some("add") => {
             let (name, config, force) = parse_add(&args[1..])?;
-            let mut managed = managed;
-            let replaced = managed.contains_key(&name);
-            if replaced && !force {
-                return Err(format!(
-                    "MCP server \"{name}\" already exists. Use --force to replace it."
-                ));
-            }
-            if !replaced && configured.contains_key(&name) && !force {
-                return Err(format!(
-                    "MCP server \"{name}\" is already configured in config.toml. Use another name, or --force to override it from the app."
-                ));
-            }
-            config.validate(&name).map_err(|error| error.to_string())?;
-            let transport = config
-                .transport
-                .clone()
-                .unwrap_or_else(|| "stdio".to_owned());
-            managed.insert(name.clone(), config);
-            save(user_config, &managed)?;
-            Ok(Outcome {
-                lines: vec![format!(
-                    "{} MCP server \"{name}\" ({transport}). Available from the next turn; /mcp shows its status.",
-                    if replaced { "Replaced" } else { "Added" }
-                )],
-                changed: true,
-            })
+            add(user_config, &name, config, force, configured)
         }
         Some(other) => Err(format!(
             "unknown /mcp action {other:?}. {}",
@@ -177,6 +152,44 @@ pub fn run(
         )),
         None => Err(USAGE.join("\n")),
     }
+}
+
+/// Add (or, with `force`, replace) one server in the managed file, as `/mcp
+/// add` does; `/plugins` adds a catalog service through it.
+pub fn add(
+    user_config: &Path,
+    name: &str,
+    config: McpServerConfigV2,
+    force: bool,
+    configured: &BTreeMap<String, McpServerConfigV2>,
+) -> Result<Outcome, String> {
+    let name = validate_name(name)?;
+    let mut managed = load(user_config);
+    let replaced = managed.contains_key(name);
+    if replaced && !force {
+        return Err(format!(
+            "MCP server \"{name}\" already exists. Use --force to replace it."
+        ));
+    }
+    if !replaced && configured.contains_key(name) && !force {
+        return Err(format!(
+            "MCP server \"{name}\" is already configured in config.toml. Use another name, or --force to override it from the app."
+        ));
+    }
+    config.validate(name).map_err(|error| error.to_string())?;
+    let transport = config
+        .transport
+        .clone()
+        .unwrap_or_else(|| "stdio".to_owned());
+    managed.insert(name.to_owned(), config);
+    save(user_config, &managed)?;
+    Ok(Outcome {
+        lines: vec![format!(
+            "{} MCP server \"{name}\" ({transport}). Available from the next turn; /mcp shows its status.",
+            if replaced { "Replaced" } else { "Added" }
+        )],
+        changed: true,
+    })
 }
 
 /// prime-agent's `parseMcpAddArgs`, onto ha's server configuration: options,
@@ -343,6 +356,9 @@ fn describe(name: &str, config: &McpServerConfigV2, managed: bool) -> Vec<String
     }
     if let Some(bearer) = &config.bearer_token_env {
         lines.push(format!("  bearer token from ${bearer}"));
+    }
+    if let Some(entry) = &config.bearer_token_credential {
+        lines.push(format!("  bearer token from the saved key {entry}"));
     }
     lines
 }
