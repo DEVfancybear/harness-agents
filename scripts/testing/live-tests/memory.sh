@@ -221,7 +221,10 @@ touch "$RX/quiet.marker"
 say q1 "Đọc từng file trong thư mục notes bằng read_file, mỗi lần một file (12 lần gọi), rồi tóm tắt chúng trong một câu." | tail -2
 # Quiet for HA_IDLE_REVIEW_SECONDS, then a review of its own model calls: wait
 # for its watermark rather than a fixed time, as a long turn ends it later.
-for _ in $(seq 1 240); do
+# The review is up to five model calls (step judge, gate, planner, repair,
+# outcomes); a planner that wrote 7,500 tokens took 139 s of them on
+# 2026-11-20, and the review ended after the old 240 s wait.
+for _ in $(seq 1 600); do
   find "$D/sessions" -name review_watermark -newer "$RX/quiet.marker" | grep -q . && break
   sleep 1
 done
