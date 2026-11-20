@@ -435,6 +435,17 @@ pub trait SessionPort: Send {
     fn connect_plugin(&mut self, _id: &str) -> Result<String, String> {
         Err("this backend does not manage MCP servers".to_owned())
     }
+    /// For a catalog service that connects with an API key: what the masked
+    /// prompt asks for (`GITHUB_PAT_TOKEN`). `None` connects it with
+    /// [`Self::connect_plugin`] instead.
+    fn plugin_key_prompt(&self, _id: &str) -> Option<String> {
+        None
+    }
+    /// Connect an API-key catalog service: save `key` in the credential file
+    /// and add the service as an MCP server that sends it as its bearer.
+    fn connect_plugin_with_key(&mut self, _id: &str, _key: &str) -> Result<String, String> {
+        Err("this backend does not manage MCP servers".to_owned())
+    }
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
@@ -4965,7 +4976,9 @@ impl SessionPort for AgentSessionService {
             return Err(format!(
                 "{} cannot be connected from /plugins: {}",
                 service.label,
-                if service.auth == "api_key" {
+                if service.key_connectable() {
+                    format!("it connects with an API key; run /plugins connect {id} and paste it")
+                } else if service.auth == "api_key" {
                     "it needs an API key; add it with /mcp add".to_owned()
                 } else {
                     service
@@ -5003,6 +5016,72 @@ impl SessionPort for AgentSessionService {
         ))
     }
 
+    fn plugin_key_prompt(&self, id: &str) -> Option<String> {
+        super::mcp_catalog::load(&self.global_config_dir, &self.data_dir)
+            .into_iter()
+            .find(|service| service.id == id)
+            .filter(super::mcp_catalog::Service::key_connectable)
+            .and_then(|service| service.bearer_key)
+    }
+
+    fn connect_plugin_with_key(&mut self, id: &str, key: &str) -> Result<String, String> {
+        let service = super::mcp_catalog::load(&self.global_config_dir, &self.data_dir)
+            .into_iter()
+            .find(|service| service.id == id && service.key_connectable())
+            .ok_or_else(|| format!("{id} is not a catalog service that connects with a key"))?;
+        let key = key.trim();
+        // The key goes in an HTTP header: one token, no spaces or controls.
+        if key.is_empty()
+            || key.len() > 4096
+            || key.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(format!(
+                "that is not a usable {}: it must be one token without spaces; nothing was saved",
+                service.bearer_key.as_deref().unwrap_or("API key")
+            ));
+        }
+        let entry = super::mcp_catalog::key_credential(id);
+        let auth = super::credentials::resolve_file(&self.environment, &self.data_dir);
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .map_err(|error| error.to_string())?;
+        let had_key = super::credentials::load(&auth, &entry).ok().flatten();
+        super::credentials::save(&auth, &entry, &super::credentials::Credential::api_key(key))
+            .map_err(|error| format!("the key could not be saved: {error}"))?;
+        let server = harness_types::McpServerConfigV2 {
+            transport: Some("streamable_http".to_owned()),
+            url: service.url.clone(),
+            bearer_token_credential: Some(entry.clone()),
+            ..harness_types::McpServerConfigV2::default()
+        };
+        let current = configured.get(id);
+        let already = current.is_some_and(|current| {
+            current.transport == server.transport
+                && current.url == server.url
+                && current.bearer_token_credential == server.bearer_token_credential
+        });
+        if !already
+            && let Err(error) =
+                super::mcp_config::add(&self.config_file, id, server, true, &configured)
+        {
+            // Leave the credential file as it was.
+            let _ = match had_key {
+                Some(previous) => super::credentials::save(&auth, &entry, &previous).map(|_| true),
+                None => super::credentials::remove(&auth, &entry),
+            };
+            return Err(error);
+        }
+        Ok(format!(
+            "Connected {}: the key is saved in the credential file ({entry}), never in config or history; its tools are available from the next turn",
+            service.label
+        ))
+    }
+
     fn manage_mcp(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         // prime-agent's `/mcp login <service>` and `/mcp logout <service>`.
         match (args.first().map(String::as_str), args.get(1)) {
@@ -5035,12 +5114,15 @@ impl SessionPort for AgentSessionService {
                 return Ok(vec![format!("Signing in to MCP server {name}...")]);
             }
             (Some("logout"), Some(name)) => {
-                let removed = super::credentials::remove(
-                    &super::credentials::resolve_file(&self.environment, &self.data_dir),
-                    &super::mcp_oauth::credential_key(name),
-                )
-                .map_err(|error| error.to_string())?;
-                return Ok(vec![if removed {
+                let auth = super::credentials::resolve_file(&self.environment, &self.data_dir);
+                let signed_out =
+                    super::credentials::remove(&auth, &super::mcp_oauth::credential_key(name))
+                        .map_err(|error| error.to_string())?;
+                // A key `/plugins` saved for the service goes too.
+                let forgot_key =
+                    super::credentials::remove(&auth, &super::mcp_catalog::key_credential(name))
+                        .map_err(|error| error.to_string())?;
+                return Ok(vec![if signed_out || forgot_key {
                     format!("Signed out of MCP server {name}")
                 } else {
                     format!("MCP server {name} has no sign-in")
@@ -16345,6 +16427,107 @@ mod tests {
         .expect("the sign-in is saved");
         // prime's `pending`: signed in, the handshake checked at the first call.
         assert_eq!(status(&service), "pending", "the sign-in is read");
+    }
+
+    /// Seen while testing the app: `/plugins connect github` failed with
+    /// "GitHub cannot be connected from /plugins: it needs an API key". The
+    /// token is now saved in the credential file, the server names it and
+    /// never holds it, and the card shows GitHub connected.
+    #[test]
+    fn an_api_key_service_connects_from_plugins_with_its_key_in_the_credential_file() {
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let environment = LaunchEnvironment::from_pairs([(
+            "HA_HOME",
+            home.path().to_string_lossy().into_owned(),
+        )]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.path().to_path_buf(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        let channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment.clone(), channel.sender());
+        let status = |service: &AgentSessionService| {
+            let cards = service.plugin_cards();
+            cards
+                .iter()
+                .find(|card| card["serviceId"] == "github")
+                .unwrap_or_else(|| panic!("a GitHub card: {cards:?}"))["connectionStatus"]
+                .clone()
+        };
+        assert_eq!(status(&service), "setup_required");
+        assert_eq!(
+            service.plugin_key_prompt("github").as_deref(),
+            Some("GITHUB_PAT_TOKEN")
+        );
+        assert_eq!(service.plugin_key_prompt("linear"), None, "OAuth signs in");
+        let refused = service
+            .connect_plugin("github")
+            .expect_err("connect_plugin is the OAuth path");
+        assert!(refused.contains("/plugins connect github"), "{refused}");
+        assert!(
+            service
+                .connect_plugin_with_key("github", "ghp has spaces")
+                .is_err()
+        );
+
+        let token = "ghp_fixtureToken123";
+        let message = service
+            .connect_plugin_with_key("github", &format!("  {token}\n"))
+            .expect("connected");
+        assert!(message.contains("Connected GitHub"), "{message}");
+        assert!(!message.contains(token), "{message}");
+        assert_eq!(status(&service), "connected");
+
+        let auth = credentials::resolve_file(&environment, &context.paths.data_dir);
+        assert_eq!(
+            credentials::load(&auth, "mcp-key:github")
+                .expect("credential file")
+                .map(|credential| credential.secret().to_owned())
+                .as_deref(),
+            Some(token)
+        );
+        let servers = std::fs::read_to_string(super::super::mcp_config::managed_path(
+            &context.paths.config_file,
+        ))
+        .expect("the managed servers");
+        assert!(!servers.contains(token), "the key is never in config");
+        let saved: std::collections::BTreeMap<String, harness_types::McpServerConfigV2> =
+            serde_json::from_str(&servers).expect("servers json");
+        let github = &saved["github"];
+        assert_eq!(github.transport.as_deref(), Some("streamable_http"));
+        assert_eq!(
+            github.url.as_deref(),
+            Some("https://api.githubcopilot.com/mcp/")
+        );
+        assert_eq!(
+            github.bearer_token_credential.as_deref(),
+            Some("mcp-key:github")
+        );
+        github.validate("github").expect("a valid server");
+
+        // A second connect replaces the key and keeps the one server.
+        service
+            .connect_plugin_with_key("github", "ghp_second")
+            .expect("reconnected");
+        assert_eq!(
+            credentials::load(&auth, "mcp-key:github")
+                .expect("credential file")
+                .map(|credential| credential.secret().to_owned())
+                .as_deref(),
+            Some("ghp_second")
+        );
+
+        // `/mcp logout github` forgets the key; the card says so.
+        let lines = service
+            .manage_mcp(&["logout".to_owned(), "github".to_owned()])
+            .expect("logout");
+        assert_eq!(lines, ["Signed out of MCP server github"]);
+        assert_eq!(status(&service), "not_connected");
     }
 
     /// A session's start level (`--thinking`) is that session's; `/effort`

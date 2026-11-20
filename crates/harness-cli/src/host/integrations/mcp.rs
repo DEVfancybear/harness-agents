@@ -1094,6 +1094,40 @@ fn subscription_is_nonempty(filter: &harness_extensions::rmcp::model::Subscripti
             .is_some_and(|resources| !resources.is_empty())
 }
 
+/// The main credential file (`auth.json`) of this process's data directory.
+fn credential_file() -> Option<std::path::PathBuf> {
+    let environment = super::paths::LaunchEnvironment::capture();
+    super::paths::resolve(&super::paths::PathRequest {
+        platform: super::paths::HostPlatform::current(),
+        environment: &environment,
+        explicit_data_dir: None,
+    })
+    .ok()
+    .map(|paths| super::credentials::resolve_file(&environment, &paths.data_dir))
+}
+
+/// The key saved under `entry` in the credential file, for a server's
+/// `bearer_token_credential`; an error names the entry, never a value.
+fn saved_bearer(name: &str, entry: &str) -> Result<String, harness_extensions::ExtensionError> {
+    let missing = || {
+        harness_extensions::ExtensionError::new(
+            ErrorCode::PolicyDenied,
+            format!(
+                "MCP {name} has no saved key {entry}; connect it again with /plugins connect {name}"
+            ),
+        )
+    };
+    let auth = credential_file().ok_or_else(missing)?;
+    match super::credentials::load(&auth, entry) {
+        Ok(Some(super::credentials::Credential::ApiKey { key })) => Ok(key.trim().to_owned()),
+        Ok(_) => Err(missing()),
+        Err(error) => Err(harness_extensions::ExtensionError::new(
+            ErrorCode::PolicyDenied,
+            format!("MCP {name}: {error}"),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one arm per transport
 async fn connect_one(
     name: &str,
@@ -1156,6 +1190,12 @@ async fn connect_one(
                     })
                 })
                 .transpose()?;
+            // A key `/plugins` saved in the credential file.
+            let token = match (token, config.bearer_token_credential.as_deref()) {
+                (Some(token), _) => Some(token),
+                (None, Some(entry)) => Some(saved_bearer(name, entry)?),
+                (None, None) => None,
+            };
             let mut headers = config
                 .headers
                 .iter()
@@ -1179,20 +1219,16 @@ async fn connect_one(
                     .iter()
                     .any(|(header, _)| header.eq_ignore_ascii_case("authorization")) =>
                 {
-                    let environment = super::paths::LaunchEnvironment::capture();
-                    super::paths::resolve(&super::paths::PathRequest {
-                        platform: super::paths::HostPlatform::current(),
-                        environment: &environment,
-                        explicit_data_dir: None,
-                    })
-                    .ok()
-                    .map(|paths| super::credentials::resolve_file(&environment, &paths.data_dir))
-                    .map(|auth| super::mcp_oauth::bearer(&auth, name, url))
-                    .transpose()
-                    .map_err(|message| {
-                        harness_extensions::ExtensionError::new(ErrorCode::PolicyDenied, message)
-                    })?
-                    .flatten()
+                    credential_file()
+                        .map(|auth| super::mcp_oauth::bearer(&auth, name, url))
+                        .transpose()
+                        .map_err(|message| {
+                            harness_extensions::ExtensionError::new(
+                                ErrorCode::PolicyDenied,
+                                message,
+                            )
+                        })?
+                        .flatten()
                 }
                 None => None,
             };

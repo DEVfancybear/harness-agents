@@ -182,6 +182,14 @@
           },
           "type": "array"
         },
+        "bearer_token_credential": {
+          "default": null,
+          "description": "The entry in ha's credential file (`auth.json`) whose saved key a\nStreamable HTTP server sends as `Authorization: Bearer`, so the key is\nnever written in configuration. `/plugins` sets it for a catalog\nservice that needs an API key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "bearer_token_env": {
           "default": null,
           "type": [
