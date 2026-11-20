@@ -1771,7 +1771,7 @@ impl InteractiveController {
                     let line = self.editor.display_buffer();
                     let whole = line
                         .strip_suffix(' ')
-                        .is_some_and(|name| super::commands::runs_bare(name));
+                        .is_some_and(super::commands::runs_bare);
                     if embedded
                         || (!whole
                             && (line.ends_with(' ') || !self.editor.suggestions().is_empty()))
