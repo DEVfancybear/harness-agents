@@ -147,12 +147,14 @@ if [ "$held" = 1 ]; then
   echo "   rejected: $(usage '[(r.get("kind"), r.get("reason")) for r in u.get("rejected", [])]')"
   check "the failing revision was rejected: rolled back ($rolled) or superseded by a fix ($superseded)" '[ "${rolled:-0}" -ge 1 ] || [ "${superseded:-0}" -ge 1 ]'
   # Since 0.9.15 a skill whose revision regressed is narrowed with a condition
-  # (GUARD's paired regret, docs/architecture/SELF_IMPROVEMENT_GATE.en.md): the
-  # fix may keep the flag behind a check and run the script without it when
-  # the script does not take it. Either way the broken call is not the skill's
-  # only way any more: the flag is gone, or the skill also runs report.py
-  # without it and that revision was accepted on good uses.
-  check "the revision that broke the command is not the skill now (no --summary-only, or a fallback without it that was accepted)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\"" || { skill_text | grep -qF "[\"report.py\"]" && tr -d "" < "$D/skill-usage/revisions.jsonl" | tail -1 | grep -q "\"accepted\""; }'
+  # (GUARD's paired regret, docs/architecture/SELF_IMPROVEMENT_GATE.en.md), so
+  # the fix the review lands takes one of several shapes: the flag gone; the
+  # flag kept behind a look at the script's own help, running report.py
+  # without it or stopping to ask when the help does not list it. What matters
+  # is that the call that broke is no longer run blindly: the flag is gone, or
+  # the skill checks first (`--help`) or falls back (`["report.py"]`), and that
+  # revision was accepted on good uses (live runs of 2026-11-20 saw all three).
+  check "the revision that broke the command is not the skill now (no --summary-only, or a checked or fallback form that was accepted)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\"" || { skill_text | grep -qE "\\[\"report.py\"\\]|--help" && tr -d "\r" < "$D/skill-usage/revisions.jsonl" | tail -1 | grep -q "\"accepted\""; }'
   # Since 0.9.15 a rejected revision keeps its good and bad uses: the failed
   # use is counted there, against it. A later revision may land after the
   # rollback and be accepted (the review narrows a regressed skill), so the
