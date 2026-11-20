@@ -411,6 +411,10 @@ impl InteractiveController {
     /// `plain` selects how slash-command output is delivered: the plain renderer
     /// prints it as history lines, the TUI opens it as a modal overlay.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one initializer per controller field"
+    )]
     pub fn new(
         context: &LaunchContext,
         service: Box<dyn SessionPort>,
