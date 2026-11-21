@@ -36,6 +36,9 @@ jobs:
   # minutes per phase, windows side 12.1 (P3), 13.8 (P4), 15.2 (P5), 15.7 (P6) and
   # 16.7 (P7). P0's old 10-minute limit cancelled a windows gate that was still
   # running, so every limit below is roughly twice its measured worst case.
+  # By 0.9.16 the suite had grown: runs 44786495941 to 44803811589 took 19-28
+  # minutes for P0-P6 and P7 was canceled at its 30-minute limit three times, so
+  # each P gate now has 60.
   verify-p0:
     name: P0 (${{ matrix.os }})
     strategy:
@@ -43,7 +46,7 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -60,7 +63,7 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -77,7 +80,7 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -93,7 +96,7 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -109,7 +112,7 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain

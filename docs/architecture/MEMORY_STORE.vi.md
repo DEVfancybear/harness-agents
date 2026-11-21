@@ -1536,7 +1536,7 @@ Lần meditation hằng ngày của vòng học ([LEARNING_LOOP.vi.md](LEARNING_
 tối đa 6, mỗi log 4.000 ký tự và tổng 16.000. Nó có thể báo `signals` tìm thấy
 trong đó: một lời sửa hay một giả định sai mà một log lại cho thấy, hoặc nhiều
 log cùng cho thấy. Câu trích của mỗi signal phải nằm nguyên văn trong log nó
-nêu; nó là signal của cuộc hội thoại của log đó, gắn tên log (`log` trên
+nêu (theo đường dẫn, hoặc theo tên file khi chỉ một log có tên đó); nó là signal của cuộc hội thoại của log đó, gắn tên log (`log` trên
 signal), và một lesson đã có signal từ cuộc hội thoại đó không nhận thêm từ log
 của nó. Không có bộ ghi mới: cổng (3 signal qua 2 cuộc hội thoại) thăng hạng như
 với mọi signal. Mỗi signal là một bản ghi `learning log_signal`, hoặc

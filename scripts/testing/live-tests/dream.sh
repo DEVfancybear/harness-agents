@@ -304,6 +304,38 @@ check "a signal from a log quotes that log word for word and is its conversation
 check "every signal from a log is quoted from it and is its conversation's" 'S=$(logged); [ -n "$S" ] && ! printf "%s\n" "$S" | grep -qv "^quoted own "'
 check "both logs repeat the open lesson: 3 signals from 3 conversations" '[ "${REPEATS:-0}" -ge 2 ]'
 check "the gate made the lesson a rule" '[ "$(justtest ".get(\"state\")")" = promoted ]'
+# The meditation is shown each log by its path under the project; the model
+# has named a log by its file alone, and 0.9.16 refused that log's signals as
+# "not a session log the meditation read". How it names them is its choice
+# per run, so the count of logs named by their file is printed, and the check
+# is that none of those was refused for its name. Fails on 0.9.16 when the
+# model named a log so (as on 2026-11-21); a kept one has `named` in its
+# log_signal record.
+named_by_file() { "$PY" - "$D" <<'EOF'
+import glob, json, os, sys
+kept = refused = 0
+seeded = {"2026-11-05-10_00-fixture-test-failures.md", "2026-11-06-15_30-parser-edge-cases.md"}
+for path in glob.glob(os.path.join(sys.argv[1], "diagnostics", "*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("kind") != "learning":
+            continue
+        fields = record.get("fields", {})
+        if record.get("event") == "log_signal" and fields.get("named"):
+            kept += 1
+        elif (record.get("event") == "log_signal_refused"
+              and record.get("msg") == "not a session log the meditation read"
+              and fields.get("log", "").replace("\\", "/").rsplit("/", 1)[-1] in seeded):
+            refused += 1
+print(kept, refused)
+EOF
+}
+read -r BARE_KEPT BARE_REFUSED <<<"$(named_by_file | tr -d '\r')"
+echo "   logs named by their file alone: ${BARE_KEPT:-0} kept, ${BARE_REFUSED:-0} refused for the name"
+check "no seeded log is refused for being named by its file alone (refused ${BARE_REFUSED:-?})" '[ "${BARE_REFUSED:-1}" = 0 ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result
